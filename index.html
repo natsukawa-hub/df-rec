@@ -69,6 +69,7 @@
         <div class="time" id="time">00:00</div>
         <div class="sub" id="progress">送信済み 0 / 0 チャンク</div>
         <div class="sub" id="netnote"></div>
+        <div class="sub" style="color:var(--warn)">📱 画面はこのまま点けたままに（画面を消す・他アプリに移るとその間は録音されません）</div>
       </div>
       <button class="btn btn-stop" id="stopBtn">■ 録音停止</button>
     </div>
@@ -81,7 +82,7 @@
 
   <div id="interrupt" class="hidden">
     <div class="big">⚠️ 録音停止中</div>
-    <div class="msg">録音が中断されました。<br>下のボタンをタップして再開してください。<br>（ここまでの録音は保存されています）</div>
+    <div class="msg">録音が中断されました。<br><b>画面を消す・他アプリに移ると、その間は録音されません。</b><br>画面はこのまま点けておいてください。<br>下のボタンで再開できます（ここまでの分は保存済み）。</div>
     <button id="resumeBtn">録音を再開する</button>
   </div>
 
@@ -302,9 +303,9 @@
       if(r && r.ok){
         html+='✅ 録音を保存しました。<br>';
         html+='フォルダ名：<b>'+(r.folderName||'')+'</b><br>';
-        html+='チャンク数：'+(r.chunkCount||0)+'<br>';
-        html+='結合ファイル：'+(r.combined?'作成OK':'<span class="warnline">未結合（チャンク保持でフォールバック）</span>')+'<br>';
-        if(r.missingSeqs && r.missingSeqs.length){ html+='<span class="warnline">⚠️ 欠番あり：'+r.missingSeqs.join(',')+'（要確認）</span><br>'; }
+        html+='保存チャンク数：'+(r.chunkCount||0)+'（30秒ごと）<br>';
+        if(r.missingSeqs && r.missingSeqs.length){ html+='<span class="warnline">⚠️ 欠番あり：'+r.missingSeqs.join(',')+'（夏川に連絡）</span><br>'; }
+        else { html+='欠番なし ✅<br>'; }
       } else {
         html+='<span class="warnline">⚠️ finalizeでエラーが発生しました。</span><br>ただしチャンクはDriveの _sessions に保存済みの可能性があります。<br>夏川に連絡してください。<br>詳細：'+(r && r.error || '不明');
       }
@@ -313,7 +314,10 @@
 
     // ===== visibility =====
     document.addEventListener('visibilitychange', function(){
-      if(document.visibilityState==='visible' && recording && !userStopped){
+      if(document.visibilityState==='hidden' && recording && !userStopped){
+        // 裏に回った/画面が消えた＝iOSはこの間録音しない。即座に中断扱いにして復帰時に気づかせる
+        markInterrupt();
+      } else if(document.visibilityState==='visible' && recording && !userStopped){
         requestWake();
         if(interrupted || (recorder && recorder.state==='inactive')) markInterrupt();
       }
