@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>商談録音</title>
+  <style>
+    :root{ --bg:#0f1720; --card:#1b2735; --fg:#eef3f8; --sub:#9fb0c3;
+           --accent:#2e7d32; --accentd:#1b5e20; --stop:#c62828; --warn:#ff8f00; }
+    *{ box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+    html,body{ margin:0; min-height:100%; background:var(--bg); color:var(--fg);
+      font-family:-apple-system,BlinkMacSystemFont,"Hiragino Kaku Gothic ProN","Yu Gothic",sans-serif; }
+    .wrap{ max-width:520px; margin:0 auto; padding:20px 18px 40px; }
+    h1{ font-size:18px; margin:6px 0 2px; }
+    .sales{ font-size:15px; color:var(--sub); margin-bottom:16px; }
+    .sales b{ color:var(--fg); font-size:17px; }
+    .card{ background:var(--card); border-radius:14px; padding:18px; margin-bottom:16px; }
+    label{ display:block; font-size:13px; color:var(--sub); margin-bottom:6px; }
+    input[type=text]{ width:100%; padding:14px; font-size:16px; border-radius:10px;
+      border:1px solid #33465c; background:#0d141d; color:var(--fg); }
+    input:disabled{ opacity:.6; }
+    .note{ font-size:13px; color:var(--warn); margin-top:12px; line-height:1.5; }
+    .btn{ width:100%; padding:20px; font-size:20px; font-weight:700; border:none;
+      border-radius:14px; color:#fff; margin-top:8px; }
+    .btn-start{ background:var(--accent); }
+    .btn-start:active{ background:var(--accentd); }
+    .btn-stop{ background:var(--stop); }
+    .btn:disabled{ opacity:.4; }
+    .status{ text-align:center; margin:14px 0; }
+    .rec-dot{ display:inline-block; width:12px; height:12px; border-radius:50%;
+      background:var(--stop); margin-right:8px; vertical-align:middle; animation:blink 1s infinite; }
+    @keyframes blink{ 50%{opacity:.25;} }
+    .time{ font-size:40px; font-weight:800; letter-spacing:1px; font-variant-numeric:tabular-nums; }
+    .sub{ font-size:13px; color:var(--sub); margin-top:6px; }
+    .hidden{ display:none !important; }
+    #interrupt{ position:fixed; inset:0; background:rgba(198,40,40,.97); z-index:9999;
+      display:flex; flex-direction:column; align-items:center; justify-content:center; padding:24px; }
+    #interrupt .big{ font-size:30px; font-weight:900; margin-bottom:8px; text-align:center; }
+    #interrupt .msg{ font-size:15px; opacity:.95; margin-bottom:28px; text-align:center; line-height:1.6; }
+    #interrupt button{ width:100%; max-width:360px; padding:24px; font-size:22px; font-weight:800;
+      border:none; border-radius:16px; background:#fff; color:var(--stop); }
+    #toast{ position:fixed; left:50%; bottom:26px; transform:translateX(-50%);
+      background:#000c; color:#fff; padding:10px 16px; border-radius:20px; font-size:13px; max-width:90%; }
+    .done{ background:#0d141d; border:1px solid #2e7d32; border-radius:12px; padding:16px; font-size:14px; line-height:1.7; }
+    .warnline{ color:var(--warn); }
+    .cfgerr{ background:#3a1414; border:1px solid var(--stop); border-radius:12px; padding:14px; font-size:13px; line-height:1.6; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>商談録音</h1>
+    <div class="sales" id="salesLine"></div>
+
+    <div class="card cfgerr hidden" id="cfgCard"></div>
+
+    <div class="card" id="setupCard">
+      <label for="deal">案件名（任意）</label>
+      <input type="text" id="deal" placeholder="例：〇〇株式会社 初回商談" autocomplete="off">
+      <button class="btn btn-start" id="startBtn">● 録音開始</button>
+      <div class="note">録音を始める前に、相手に録音の断りを入れてください。</div>
+      <div class="note warnline hidden" id="wakeNote">
+        ⚠️ この端末は画面常時ONに未対応です。録音中は端末の自動ロックを手動でOFFにしてください。
+      </div>
+    </div>
+
+    <div class="card hidden" id="recCard">
+      <div class="status">
+        <div><span class="rec-dot"></span><span id="recLabel">録音中</span></div>
+        <div class="time" id="time">00:00</div>
+        <div class="sub" id="progress">送信済み 0 / 0 チャンク</div>
+        <div class="sub" id="netnote"></div>
+      </div>
+      <button class="btn btn-stop" id="stopBtn">■ 録音停止</button>
+    </div>
+
+    <div class="card hidden" id="doneCard">
+      <div class="done" id="doneMsg"></div>
+      <button class="btn btn-start" id="againBtn" style="margin-top:16px;">新しい録音を始める</button>
+    </div>
+  </div>
+
+  <div id="interrupt" class="hidden">
+    <div class="big">⚠️ 録音停止中</div>
+    <div class="msg">録音が中断されました。<br>下のボタンをタップして再開してください。<br>（ここまでの録音は保存されています）</div>
+    <button id="resumeBtn">録音を再開する</button>
+  </div>
+
+  <div id="toast" class="hidden"></div>
+
+  <script>
+    // ================================================================
+    // ★設定（デプロイ時にここだけ書き換える）
+    // ================================================================
+    // GAS Web App の /exec URL（「デプロイを管理」で表示されるウェブアプリURL）
+    var API_URL = 'https://script.google.com/macros/s/AKfycbyvjG0sKZnQ_RZz1f5WoNeI_m52rebQT2VLPdvnm5jBXPgrykBbNxY3GhIe9EeNZ6dQOA/exec';
+    // Code.gs の CONFIG.UPLOAD_TOKEN と完全一致させる合言葉
+    var TOKEN   = 'df-rec';
+    // 営業キー→表示名（Code.gsのSALES_MAPと合わせる。ここは画面表示用）
+    var SALES_MAP = {
+      natsukawa:'夏川', abe:'阿部', oyama:'大山', yoshida:'吉田',
+      kenjo:'見城', okinaka:'沖中', mori:'森', nishio:'西尾'
+    };
+    // ================================================================
+
+    var SALES_KEY = new URLSearchParams(location.search).get('u') || '';
+    var SALES_NAME = SALES_MAP[SALES_KEY] || '';
+
+    var stream=null, recorder=null, mimeType='';
+    var sessionId='', startedAt=null, dealName='';
+    var seq=0, acked=0, pending=new Set();
+    var recording=false, userStopped=false, finalizing=false;
+    var wakeLock=null, timerId=null, db=null;
+
+    var $=function(id){ return document.getElementById(id); };
+
+    // 設定チェック
+    (function(){
+      var errs=[];
+      if(API_URL.indexOf('PASTE_')===0) errs.push('API_URL が未設定です（GASのウェブアプリURLを貼ってください）');
+      if(TOKEN.indexOf('CHANGE-ME')>=0) errs.push('TOKEN が初期値のままです（Code.gsのUPLOAD_TOKENと同じ文字列に変更してください）');
+      if(errs.length){
+        $('cfgCard').classList.remove('hidden');
+        $('cfgCard').innerHTML='⚠️ セットアップ未完了<br>'+errs.join('<br>');
+      }
+      if(SALES_NAME){ $('salesLine').innerHTML='担当：<b>'+SALES_NAME+'</b>'; }
+      else { $('salesLine').innerHTML='<span style="color:#ff8f00">⚠️ 営業が未指定です（URL末尾の <b>?u=</b> を確認してください）</span>'; }
+    })();
+
+    // ===== IndexedDB（再送用の永続キュー）=====
+    function openDB(){ return new Promise(function(res){
+      try{ var r=indexedDB.open('rec_queue',1);
+        r.onupgradeneeded=function(e){ e.target.result.createObjectStore('pending',{keyPath:'seq'}); };
+        r.onsuccess=function(e){ res(e.target.result); }; r.onerror=function(){ res(null); };
+      }catch(e){ res(null); } }); }
+    function qPut(rec){ return new Promise(function(res){ if(!db)return res();
+      try{ var tx=db.transaction('pending','readwrite'); tx.objectStore('pending').put(rec); tx.oncomplete=function(){res();}; tx.onerror=function(){res();}; }catch(e){res();} }); }
+    function qDel(s){ return new Promise(function(res){ if(!db)return res();
+      try{ var tx=db.transaction('pending','readwrite'); tx.objectStore('pending').delete(s); tx.oncomplete=function(){res();}; tx.onerror=function(){res();}; }catch(e){res();} }); }
+    function qAll(){ return new Promise(function(res){ if(!db)return res([]);
+      try{ var tx=db.transaction('pending','readonly'); var rq=tx.objectStore('pending').getAll(); rq.onsuccess=function(){res(rq.result||[]);}; rq.onerror=function(){res([]);}; }catch(e){res([]);} }); }
+
+    // ===== GASへの送信（fetch・単純リクエストでプリフライト回避）=====
+    function postJSON(payload){
+      payload.token = TOKEN;
+      return fetch(API_URL, {
+        method:'POST',
+        headers:{ 'Content-Type':'text/plain;charset=utf-8' },  // ←application/jsonにするとプリフライトが出てGASで失敗する
+        body: JSON.stringify(payload),
+        redirect:'follow'
+      }).then(function(r){ return r.json(); });
+    }
+
+    // ===== ユーティリティ =====
+    function pad2(n){ return (n<10?'0':'')+n; }
+    function fmtTime(ms){ var s=Math.floor(ms/1000); return pad2(Math.floor(s/60))+':'+pad2(s%60); }
+    function toast(m){ var t=$('toast'); t.textContent=m; t.classList.remove('hidden');
+      clearTimeout(t._h); t._h=setTimeout(function(){ t.classList.add('hidden'); },2500); }
+    function rand4(){ return Math.random().toString(36).slice(2,6); }
+    function blobToB64(blob){ return new Promise(function(res,rej){
+      var fr=new FileReader(); fr.onload=function(){ var s=fr.result; res(s.slice(s.indexOf(',')+1)); };
+      fr.onerror=rej; fr.readAsDataURL(blob); }); }
+    function pickMime(){ var c=['audio/mp4','audio/webm;codecs=opus','audio/webm','audio/mpeg'];
+      for(var i=0;i<c.length;i++){ try{ if(window.MediaRecorder && MediaRecorder.isTypeSupported(c[i])) return c[i]; }catch(e){} } return ''; }
+    function updateProgress(){ $('progress').textContent='送信済み '+acked+' / '+seq+' チャンク'+(pending.size?'（再送待ち '+pending.size+'）':''); }
+
+    // ===== Wake Lock =====
+    function requestWake(){ if(!('wakeLock' in navigator)){ $('wakeNote').classList.remove('hidden'); return; }
+      navigator.wakeLock.request('screen').then(function(wl){ wakeLock=wl; wakeLock.addEventListener('release',function(){ wakeLock=null; }); })
+      .catch(function(){ $('wakeNote').classList.remove('hidden'); }); }
+    function releaseWake(){ try{ if(wakeLock){ wakeLock.release(); wakeLock=null; } }catch(e){} }
+
+    // ===== チャンク送信 =====
+    function handleData(e){
+      if(!e.data || e.data.size===0) return;
+      var s=seq++; pending.add(s); updateProgress();
+      blobToB64(e.data).then(function(b64){
+        return sendChunk({ action:'chunk', sessionId:sessionId, seq:s, mimeType:mimeType, u:SALES_KEY, dealName:dealName, dataB64:b64 });
+      });
+    }
+    function sendChunk(payload){
+      return postJSON(payload).then(function(r){
+        if(r && r.ok){ pending.delete(payload.seq); acked++; qDel(payload.seq); updateProgress(); }
+        else { throw new Error(r && r.error || 'unknown'); }
+      }).catch(function(){ qPut({seq:payload.seq, payload:payload}); scheduleRetry(); updateProgress(); });
+    }
+
+    // ===== 再送（指数バックオフ）=====
+    var retryTimer=null, retryDelay=2000;
+    function scheduleRetry(){ if(retryTimer) return;
+      retryTimer=setTimeout(function(){ retryTimer=null;
+        flushQueue().then(function(done){ if(!done){ retryDelay=Math.min(retryDelay*2,60000); scheduleRetry(); } else { retryDelay=2000; } });
+      }, retryDelay); }
+    function flushQueue(){
+      return qAll().then(function(list){
+        if(!list.length) return true;
+        var chain=Promise.resolve();
+        list.forEach(function(rec){ chain=chain.then(function(){
+          return postJSON(rec.payload).then(function(r){ if(r && r.ok){ pending.delete(rec.seq); acked++; return qDel(rec.seq); } }).catch(function(){});
+        }); });
+        return chain.then(function(){ return qAll(); }).then(function(rest){ updateProgress(); return rest.length===0; });
+      });
+    }
+    window.addEventListener('online', function(){ $('netnote').textContent=''; retryDelay=2000; flushQueue(); });
+    window.addEventListener('offline', function(){ $('netnote').textContent='📶 オフライン：録音は継続中。電波復帰後に自動送信します'; });
+
+    // ===== 録音開始 =====
+    function startRecording(){
+      if(API_URL.indexOf('PASTE_')===0 || TOKEN.indexOf('CHANGE-ME')>=0){ alert('セットアップ未完了：API_URL / TOKEN を設定してください。'); return; }
+      dealName=($('deal').value||'').trim();
+      mimeType=pickMime();
+      navigator.mediaDevices.getUserMedia({audio:true}).then(function(st){
+        stream=st; startedAt=new Date(); var ts=startedAt;
+        var stamp=ts.getFullYear()+pad2(ts.getMonth()+1)+pad2(ts.getDate())+'_'+pad2(ts.getHours())+pad2(ts.getMinutes())+pad2(ts.getSeconds());
+        sessionId=stamp+'_'+(SALES_KEY||'x')+'_'+rand4();
+        seq=0; acked=0; pending.clear(); userStopped=false; finalizing=false;
+        buildRecorder(); recorder.start(30000); recording=true;
+        $('setupCard').classList.add('hidden'); $('recCard').classList.remove('hidden'); $('doneCard').classList.add('hidden');
+        $('deal').disabled=true; requestWake(); startTimer();
+      }).catch(function(err){
+        alert('マイクにアクセスできませんでした。ブラウザのマイク許可を確認してください。\n'+err);
+      });
+    }
+    function buildRecorder(){
+      var opts={ audioBitsPerSecond:48000 };
+      if(mimeType) opts.mimeType=mimeType;
+      try{ recorder=new MediaRecorder(stream,opts); }
+      catch(e){ try{ recorder=new MediaRecorder(stream, mimeType?{mimeType:mimeType}:{}); }catch(e2){ recorder=new MediaRecorder(stream); } }
+      if(!mimeType && recorder.mimeType) mimeType=recorder.mimeType;
+      recorder.ondataavailable=handleData;
+      recorder.onpause=function(){ if(recording) onInterrupt(); };
+      recorder.onerror=function(){ if(recording) onInterrupt(); };
+      recorder.onstop=function(){ if(userStopped){ finalize(); } else if(recording){ onInterrupt(); } };
+    }
+    function startTimer(){ clearInterval(timerId); timerId=setInterval(function(){ if(startedAt) $('time').textContent=fmtTime(Date.now()-startedAt.getTime()); },500); }
+
+    // ===== 中断・再開 =====
+    function onInterrupt(){ $('interrupt').classList.remove('hidden'); }
+    function resumeRecording(){
+      var alive=stream && stream.getAudioTracks().some(function(t){ return t.readyState==='live'; });
+      var proceed=alive?Promise.resolve(stream):navigator.mediaDevices.getUserMedia({audio:true}).then(function(st){ stream=st; return st; });
+      proceed.then(function(){ buildRecorder(); recorder.start(30000); $('interrupt').classList.add('hidden'); requestWake(); toast('録音を再開しました'); })
+      .catch(function(){ alert('録音の再開に失敗しました。マイク許可を確認して、もう一度お試しください。'); });
+    }
+
+    // ===== 停止 → finalize =====
+    function stopRecording(){
+      if(!recording) return;
+      userStopped=true; recording=false;
+      try{ if(recorder && recorder.state!=='inactive') recorder.stop(); else finalize(); }catch(e){ finalize(); }
+      clearInterval(timerId); releaseWake();
+      try{ stream && stream.getTracks().forEach(function(t){ t.stop(); }); }catch(e){}
+    }
+    function finalize(){
+      if(finalizing) return; finalizing=true;
+      $('recLabel').textContent='アップロード中…'; $('stopBtn').disabled=true;
+      var wait=function(tries){
+        flushQueue().then(function(){
+          $('progress').textContent='アップロード中… 送信済み '+acked+' / '+seq+(pending.size?'（残り '+pending.size+'）':'');
+          if(pending.size===0 || tries<=0){ doFinalize(); } else { setTimeout(function(){ wait(tries-1); },2000); }
+        });
+      };
+      wait(40);
+    }
+    function doFinalize(){
+      var payload={ action:'finalize', sessionId:sessionId, u:SALES_KEY, dealName:dealName,
+        startedAt: startedAt?startedAt.toISOString():new Date().toISOString(), endedAt:new Date().toISOString(),
+        mimeType:mimeType, expectedChunks:seq };
+      postJSON(payload).then(function(r){ showDone(r); }).catch(function(e){ showDone({ok:false,error:String(e)}); });
+    }
+    function showDone(r){
+      $('recCard').classList.add('hidden'); $('doneCard').classList.remove('hidden');
+      var html='';
+      if(r && r.ok){
+        html+='✅ 録音を保存しました。<br>';
+        html+='フォルダ名：<b>'+(r.folderName||'')+'</b><br>';
+        html+='チャンク数：'+(r.chunkCount||0)+'<br>';
+        html+='結合ファイル：'+(r.combined?'作成OK':'<span class="warnline">未結合（チャンク保持でフォールバック）</span>')+'<br>';
+        if(r.missingSeqs && r.missingSeqs.length){ html+='<span class="warnline">⚠️ 欠番あり：'+r.missingSeqs.join(',')+'（要確認）</span><br>'; }
+      } else {
+        html+='<span class="warnline">⚠️ finalizeでエラーが発生しました。</span><br>ただしチャンクはDriveの _sessions に保存済みの可能性があります。<br>夏川に連絡してください。<br>詳細：'+(r && r.error || '不明');
+      }
+      $('doneMsg').innerHTML=html; $('stopBtn').disabled=false;
+    }
+
+    // ===== visibility =====
+    document.addEventListener('visibilitychange', function(){
+      if(document.visibilityState==='visible' && recording){ requestWake(); if(recorder && recorder.state==='inactive') onInterrupt(); }
+    });
+
+    // ===== ボタン =====
+    $('startBtn').addEventListener('click', startRecording);
+    $('stopBtn').addEventListener('click', stopRecording);
+    $('resumeBtn').addEventListener('click', resumeRecording);
+    $('againBtn').addEventListener('click', function(){
+      $('deal').disabled=false; $('deal').value='';
+      $('doneCard').classList.add('hidden'); $('setupCard').classList.remove('hidden');
+      $('time').textContent='00:00'; $('progress').textContent='送信済み 0 / 0 チャンク'; $('netnote').textContent='';
+    });
+
+    openDB().then(function(d){ db=d; return flushQueue(); });
+  </script>
+</body>
+</html>
