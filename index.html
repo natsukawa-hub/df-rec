@@ -95,7 +95,7 @@
     // GAS Web App の /exec URL（「デプロイを管理」で表示されるウェブアプリURL）
     var API_URL = 'https://script.google.com/macros/s/AKfycbyvjG0sKZnQ_RZz1f5WoNeI_m52rebQT2VLPdvnm5jBXPgrykBbNxY3GhIe9EeNZ6dQOA/exec';
     // Code.gs の CONFIG.UPLOAD_TOKEN と完全一致させる合言葉
-    var TOKEN   = 'df-rec';
+    var TOKEN   = 'df-rec-7gljy_kPxnAmM0FgJ87lGf0A';
     // 営業キー→表示名（Code.gsのSALES_MAPと合わせる。ここは画面表示用）
     var SALES_MAP = {
       natsukawa:'夏川', abe:'阿部', oyama:'大山', yoshida:'吉田',
@@ -119,7 +119,7 @@
     (function(){
       var errs=[];
       if(API_URL.indexOf('PASTE_')===0) errs.push('API_URL が未設定です（GASのウェブアプリURLを貼ってください）');
-      if(TOKEN.indexOf('CHANGE-ME')>=0) errs.push('TOKEN が初期値のままです（Code.gsのUPLOAD_TOKENと同じ文字列に変更してください）');
+      if(TOKEN.indexOf('CHANGE')>=0 || TOKEN.length<12) errs.push('TOKEN が弱い/初期値です（Code.gsのUPLOAD_TOKENと同じ強い文字列にしてください）');
       if(errs.length){
         $('cfgCard').classList.remove('hidden');
         $('cfgCard').innerHTML='⚠️ セットアップ未完了<br>'+errs.join('<br>');
@@ -130,8 +130,12 @@
 
     // ===== IndexedDB（再送用の永続キュー）=====
     function openDB(){ return new Promise(function(res){
-      try{ var r=indexedDB.open('rec_queue',1);
-        r.onupgradeneeded=function(e){ e.target.result.createObjectStore('pending',{keyPath:'seq'}); };
+      try{ var r=indexedDB.open('rec_queue',2);
+        r.onupgradeneeded=function(e){
+          var d=e.target.result;
+          if(d.objectStoreNames.contains('pending')) d.deleteObjectStore('pending');
+          d.createObjectStore('pending',{keyPath:'key'});   // key = sessionId+'_'+seq（セッション跨ぎの衝突・誤削除を防ぐ）
+        };
         r.onsuccess=function(e){ res(e.target.result); }; r.onerror=function(){ res(null); };
       }catch(e){ res(null); } }); }
     function qPut(rec){ return new Promise(function(res){ if(!db)return res();
@@ -180,10 +184,11 @@
       });
     }
     function sendChunk(payload){
+      var key=payload.sessionId+'_'+payload.seq;
       return postJSON(payload).then(function(r){
-        if(r && r.ok){ pending.delete(payload.seq); acked++; qDel(payload.seq); updateProgress(); }
+        if(r && r.ok){ pending.delete(payload.seq); acked++; qDel(key); updateProgress(); }
         else { throw new Error(r && r.error || 'unknown'); }
-      }).catch(function(){ qPut({seq:payload.seq, payload:payload}); scheduleRetry(); updateProgress(); });
+      }).catch(function(){ qPut({key:key, sessionId:payload.sessionId, seq:payload.seq, payload:payload}); scheduleRetry(); updateProgress(); });
     }
 
     // ===== 再送（指数バックオフ）=====
@@ -197,7 +202,12 @@
         if(!list.length) return true;
         var chain=Promise.resolve();
         list.forEach(function(rec){ chain=chain.then(function(){
-          return postJSON(rec.payload).then(function(r){ if(r && r.ok){ pending.delete(rec.seq); acked++; return qDel(rec.seq); } }).catch(function(){});
+          return postJSON(rec.payload).then(function(r){
+            if(r && r.ok){
+              if(rec.sessionId===sessionId){ pending.delete(rec.seq); acked++; }  // 現セッションのカウンタだけ触る（過去セッション残骸で誤カウントしない）
+              return qDel(rec.key);
+            }
+          }).catch(function(){});
         }); });
         return chain.then(function(){ return qAll(); }).then(function(rest){ updateProgress(); return rest.length===0; });
       });
@@ -213,7 +223,7 @@
       navigator.mediaDevices.getUserMedia({audio:true}).then(function(st){
         stream=st; startedAt=new Date(); var ts=startedAt;
         var stamp=ts.getFullYear()+pad2(ts.getMonth()+1)+pad2(ts.getDate())+'_'+pad2(ts.getHours())+pad2(ts.getMinutes())+pad2(ts.getSeconds());
-        sessionId=stamp+'_'+(SALES_KEY||'x')+'_'+rand4();
+        sessionId=stamp+'_'+(SALES_KEY||'x')+'_'+rand4()+rand4();  // 乱数8桁（他人セッションのsessionId推測・finalize妨害を困難に）
         seq=0; acked=0; pending.clear(); userStopped=false; finalizing=false; interrupted=false;
         recording=true;
         $('setupCard').classList.add('hidden'); $('recCard').classList.remove('hidden'); $('doneCard').classList.add('hidden');
@@ -257,7 +267,12 @@
     function startTimer(){ clearInterval(timerId); timerId=setInterval(function(){ if(startedAt) $('time').textContent=fmtTime(Date.now()-startedAt.getTime()); },500); }
 
     // ===== 中断・再開 =====
-    function markInterrupt(){ interrupted=true; $('interrupt').classList.remove('hidden'); }
+    function markInterrupt(){
+      interrupted=true;
+      // 中断時点までのバッファを確定させるため現recorderを閉じる（stopでondataavailableが発火し保存される）
+      try{ if(recorder && recorder.state==='recording') recorder.stop(); }catch(e){}
+      $('interrupt').classList.remove('hidden');
+    }
     function resumeRecording(){
       var alive=stream && stream.getAudioTracks().some(function(t){ return t.readyState==='live'; });
       var proceed=alive?Promise.resolve(stream):navigator.mediaDevices.getUserMedia({audio:true}).then(function(st){ stream=st; return st; });
