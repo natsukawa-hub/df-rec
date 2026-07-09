@@ -110,6 +110,7 @@
     var seq=0, acked=0, pending=new Set();
     var recording=false, userStopped=false, finalizing=false;
     var wakeLock=null, timerId=null, db=null;
+    var cycleTimer=null, SEG_MS=30000, interrupted=false;
 
     var $=function(id){ return document.getElementById(id); };
 
@@ -212,14 +213,20 @@
         stream=st; startedAt=new Date(); var ts=startedAt;
         var stamp=ts.getFullYear()+pad2(ts.getMonth()+1)+pad2(ts.getDate())+'_'+pad2(ts.getHours())+pad2(ts.getMinutes())+pad2(ts.getSeconds());
         sessionId=stamp+'_'+(SALES_KEY||'x')+'_'+rand4();
-        seq=0; acked=0; pending.clear(); userStopped=false; finalizing=false;
-        buildRecorder(); recorder.start(30000); recording=true;
+        seq=0; acked=0; pending.clear(); userStopped=false; finalizing=false; interrupted=false;
+        recording=true;
         $('setupCard').classList.add('hidden'); $('recCard').classList.remove('hidden'); $('doneCard').classList.add('hidden');
         $('deal').disabled=true; requestWake(); startTimer();
+        startSegment();
+        // iOS Safari は timeslice を無視するため、30秒ごとに手動で区切って分割チャンク化する
+        cycleTimer=setInterval(rotateSegment, SEG_MS);
       }).catch(function(err){
+        recording=false;
         alert('マイクにアクセスできませんでした。ブラウザのマイク許可を確認してください。\n'+err);
       });
     }
+
+    // 1セグメント＝1チャンク。stop()時にそのセグメント全体が ondataavailable で出る（iOS/Android共通で確実）
     function buildRecorder(){
       var opts={ audioBitsPerSecond:48000 };
       if(mimeType) opts.mimeType=mimeType;
@@ -227,31 +234,53 @@
       catch(e){ try{ recorder=new MediaRecorder(stream, mimeType?{mimeType:mimeType}:{}); }catch(e2){ recorder=new MediaRecorder(stream); } }
       if(!mimeType && recorder.mimeType) mimeType=recorder.mimeType;
       recorder.ondataavailable=handleData;
-      recorder.onpause=function(){ if(recording) onInterrupt(); };
-      recorder.onerror=function(){ if(recording) onInterrupt(); };
-      recorder.onstop=function(){ if(userStopped){ finalize(); } else if(recording){ onInterrupt(); } };
+      recorder.onerror=function(){ if(recording) markInterrupt(); };
+      recorder.onstop=onSegmentStop;
+    }
+    function startSegment(){
+      buildRecorder();
+      try{ recorder.start(); }catch(e){ markInterrupt(); }
+    }
+    function rotateSegment(){
+      // 30秒ごと：録音中なら現セグメントを閉じる（onSegmentStopで次を開始）
+      if(recording && !interrupted && recorder && recorder.state==='recording'){
+        try{ recorder.stop(); }catch(e){}
+      }
+    }
+    function onSegmentStop(){
+      if(userStopped){ finalize(); return; }
+      if(!recording) return;
+      if(document.visibilityState==='visible' && !interrupted){ startSegment(); }   // 次のセグメントへ
+      else { markInterrupt(); }
     }
     function startTimer(){ clearInterval(timerId); timerId=setInterval(function(){ if(startedAt) $('time').textContent=fmtTime(Date.now()-startedAt.getTime()); },500); }
 
     // ===== 中断・再開 =====
-    function onInterrupt(){ $('interrupt').classList.remove('hidden'); }
+    function markInterrupt(){ interrupted=true; $('interrupt').classList.remove('hidden'); }
     function resumeRecording(){
       var alive=stream && stream.getAudioTracks().some(function(t){ return t.readyState==='live'; });
       var proceed=alive?Promise.resolve(stream):navigator.mediaDevices.getUserMedia({audio:true}).then(function(st){ stream=st; return st; });
-      proceed.then(function(){ buildRecorder(); recorder.start(30000); $('interrupt').classList.add('hidden'); requestWake(); toast('録音を再開しました'); })
-      .catch(function(){ alert('録音の再開に失敗しました。マイク許可を確認して、もう一度お試しください。'); });
+      proceed.then(function(){
+        interrupted=false; recording=true;
+        if(!cycleTimer) cycleTimer=setInterval(rotateSegment, SEG_MS);
+        startSegment();
+        $('interrupt').classList.add('hidden'); requestWake(); toast('録音を再開しました');
+      }).catch(function(){ alert('録音の再開に失敗しました。マイク許可を確認して、もう一度お試しください。'); });
     }
 
     // ===== 停止 → finalize =====
     function stopRecording(){
-      if(!recording) return;
-      userStopped=true; recording=false;
-      try{ if(recorder && recorder.state!=='inactive') recorder.stop(); else finalize(); }catch(e){ finalize(); }
+      if(!recording && !userStopped) return;
+      userStopped=true; recording=false; interrupted=false;
+      clearInterval(cycleTimer); cycleTimer=null;
       clearInterval(timerId); releaseWake();
-      try{ stream && stream.getTracks().forEach(function(t){ t.stop(); }); }catch(e){}
+      $('interrupt').classList.add('hidden');
+      // 現セグメントを閉じる→onSegmentStopでfinalize（閉じられない状態なら直接finalize）
+      try{ if(recorder && recorder.state!=='inactive') recorder.stop(); else finalize(); }catch(e){ finalize(); }
     }
     function finalize(){
       if(finalizing) return; finalizing=true;
+      try{ stream && stream.getTracks().forEach(function(t){ t.stop(); }); }catch(e){}
       $('recLabel').textContent='アップロード中…'; $('stopBtn').disabled=true;
       var wait=function(tries){
         flushQueue().then(function(){
@@ -284,7 +313,10 @@
 
     // ===== visibility =====
     document.addEventListener('visibilitychange', function(){
-      if(document.visibilityState==='visible' && recording){ requestWake(); if(recorder && recorder.state==='inactive') onInterrupt(); }
+      if(document.visibilityState==='visible' && recording && !userStopped){
+        requestWake();
+        if(interrupted || (recorder && recorder.state==='inactive')) markInterrupt();
+      }
     });
 
     // ===== ボタン =====
