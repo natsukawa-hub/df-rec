@@ -32,6 +32,7 @@
     @keyframes blink{ 50%{opacity:.25;} }
     .time{ font-size:40px; font-weight:800; letter-spacing:1px; font-variant-numeric:tabular-nums; }
     .sub{ font-size:13px; color:var(--sub); margin-top:6px; }
+    .stallwarn{ color:var(--warn); font-weight:700; margin-top:10px; }
     .hidden{ display:none !important; }
     #interrupt{ position:fixed; inset:0; background:rgba(198,40,40,.97); z-index:9999;
       display:flex; flex-direction:column; align-items:center; justify-content:center; padding:24px; }
@@ -69,6 +70,7 @@
         <div class="time" id="time">00:00</div>
         <div class="sub" id="progress">送信済み 0 / 0 チャンク</div>
         <div class="sub" id="netnote"></div>
+        <div class="sub stallwarn hidden" id="stallnote"></div>
         <div class="sub" style="color:var(--warn)">📱 画面はこのまま点けたままに（画面を消す・他アプリに移るとその間は録音されません）</div>
       </div>
       <button class="btn btn-stop" id="stopBtn">■ 録音停止</button>
@@ -89,105 +91,161 @@
   <div id="toast" class="hidden"></div>
 
   <script>
-    // ================================================================
-    // ★設定（デプロイ時にここだけ書き換える）
-    // ================================================================
-    // GAS Web App の /exec URL（「デプロイを管理」で表示されるウェブアプリURL）
+    // ================== 設定（デプロイ時にここだけ書き換える） ==================
     var API_URL = 'https://script.google.com/macros/s/AKfycbyvjG0sKZnQ_RZz1f5WoNeI_m52rebQT2VLPdvnm5jBXPgrykBbNxY3GhIe9EeNZ6dQOA/exec';
-    // Code.gs の CONFIG.UPLOAD_TOKEN と完全一致させる合言葉
     var TOKEN   = 'df-rec-7gljy_kPxnAmM0FgJ87lGf0A';
-    // 営業キー→表示名（Code.gsのSALES_MAPと合わせる。ここは画面表示用）
-    var SALES_MAP = {
-      natsukawa:'夏川', abe:'阿部', oyama:'大山', yoshida:'吉田',
-      kenjo:'見城', okinaka:'沖中', mori:'森', nishio:'西尾'
-    };
-    // ================================================================
+    var SALES_MAP = { natsukawa:'夏川', abe:'阿部', oyama:'大山', yoshida:'吉田', kenjo:'見城', okinaka:'沖中', mori:'森', nishio:'西尾' };
+    var PAYLOAD_SCHEMA_VERSION = 2;
+    // ==========================================================================
 
     var SALES_KEY = new URLSearchParams(location.search).get('u') || '';
     var SALES_NAME = SALES_MAP[SALES_KEY] || '';
 
     var stream=null, recorder=null, mimeType='';
-    var sessionId='', startedAt=null, dealName='';
-    var seq=0, acked=0, pending=new Set();
+    var sessionId='', startedAt=null, stoppedAt=null, dealName='';
+    var seq=0, acked=0, conflictCount=0, pending=new Set();
     var recording=false, userStopped=false, finalizing=false;
     var wakeLock=null, timerId=null, db=null;
     var cycleTimer=null, SEG_MS=30000, interrupted=false;
 
+    // A：時刻契約
+    var segments=[], interruptions=[], curSeg=null, curInterruption=null;
+    var pendingBlobs={};        // #4：seq->{blob,segRec} 変換前Blob参照（変換失敗でも喪失しない）
+    var intentPersisted=false;  // #3：finalize intentを端末に保存できたか
+
+    // G：watchdog
+    var lastDataAvailableAt=0, lastServerAckAt=0, oldestPendingAt=0, watchdogTimer=null;
+    var captureStallStrikes=0, uploadStallStrikes=0;
+    var CAPTURE_STALL_MS=60000, UPLOAD_STALL_MS=90000, WATCHDOG_INTERVAL_MS=15000;
+
     var $=function(id){ return document.getElementById(id); };
 
-    // 設定チェック
     (function(){
       var errs=[];
       if(API_URL.indexOf('PASTE_')===0) errs.push('API_URL が未設定です（GASのウェブアプリURLを貼ってください）');
       if(TOKEN.indexOf('CHANGE')>=0 || TOKEN.length<12) errs.push('TOKEN が弱い/初期値です（Code.gsのUPLOAD_TOKENと同じ強い文字列にしてください）');
-      if(errs.length){
-        $('cfgCard').classList.remove('hidden');
-        $('cfgCard').innerHTML='⚠️ セットアップ未完了<br>'+errs.join('<br>');
-      }
+      if(errs.length){ $('cfgCard').classList.remove('hidden'); $('cfgCard').innerHTML='⚠️ セットアップ未完了<br>'+errs.join('<br>'); }
       if(SALES_NAME){ $('salesLine').innerHTML='担当：<b>'+SALES_NAME+'</b>'; }
       else { $('salesLine').innerHTML='<span style="color:#ff8f00">⚠️ 営業が未指定です（URL末尾の <b>?u=</b> を確認してください）</span>'; }
     })();
 
-    // ===== IndexedDB（再送用の永続キュー）=====
+    // ===== 時刻ユーティリティ =====
+    function nowISO(){ return new Date().toISOString(); }
+    function mono(){ try{ return { timeOrigin: performance.timeOrigin, now: performance.now() }; }catch(e){ return null; } }
+
+    // ===== IndexedDB（pending=chunk再送／ctrl=finalize intent）=====
     function openDB(){ return new Promise(function(res){
-      try{ var r=indexedDB.open('rec_queue',2);
+      var settled=false; var done=function(v){ if(!settled){ settled=true; res(v); } };
+      try{ var r=indexedDB.open('rec_queue',3);
         r.onupgradeneeded=function(e){
           var d=e.target.result;
-          if(d.objectStoreNames.contains('pending')) d.deleteObjectStore('pending');
-          d.createObjectStore('pending',{keyPath:'key'});   // key = sessionId+'_'+seq（セッション跨ぎの衝突・誤削除を防ぐ）
+          if(!d.objectStoreNames.contains('pending')) d.createObjectStore('pending',{keyPath:'key'});
+          if(!d.objectStoreNames.contains('ctrl')) d.createObjectStore('ctrl',{keyPath:'key'});
         };
-        r.onsuccess=function(e){ res(e.target.result); }; r.onerror=function(){ res(null); };
-      }catch(e){ res(null); } }); }
-    function qPut(rec){ return new Promise(function(res){ if(!db)return res();
-      try{ var tx=db.transaction('pending','readwrite'); tx.objectStore('pending').put(rec); tx.oncomplete=function(){res();}; tx.onerror=function(){res();}; }catch(e){res();} }); }
+        r.onblocked=function(){ toast('別タブで古い録音画面が開いています。閉じてください（この画面は自動再送が制限されます）'); done(null); }; // #10：初期化を止めない（永続再送は制限）
+        r.onsuccess=function(e){ var d=e.target.result; try{ d.onversionchange=function(){ d.close(); }; }catch(_){}; done(d); };
+        r.onerror=function(){ done(null); };
+      }catch(e){ done(null); } }); }
+    function qPut(rec){ return new Promise(function(res){ if(!db)return res(false);
+      try{ var tx=db.transaction('pending','readwrite'); tx.objectStore('pending').put(rec); tx.oncomplete=function(){res(true);}; tx.onerror=function(){res(false);}; tx.onabort=function(){res(false);}; }catch(e){res(false);} }); }
     function qDel(s){ return new Promise(function(res){ if(!db)return res();
       try{ var tx=db.transaction('pending','readwrite'); tx.objectStore('pending').delete(s); tx.oncomplete=function(){res();}; tx.onerror=function(){res();}; }catch(e){res();} }); }
     function qAll(){ return new Promise(function(res){ if(!db)return res([]);
       try{ var tx=db.transaction('pending','readonly'); var rq=tx.objectStore('pending').getAll(); rq.onsuccess=function(){res(rq.result||[]);}; rq.onerror=function(){res([]);}; }catch(e){res([]);} }); }
+    // ctrl store（finalize intent）— C2：成否をboolで返す
+    function cPut(rec){ return new Promise(function(res){ if(!db)return res(false);
+      try{ var tx=db.transaction('ctrl','readwrite'); tx.objectStore('ctrl').put(rec); tx.oncomplete=function(){res(true);}; tx.onerror=function(){res(false);}; tx.onabort=function(){res(false);}; }catch(e){res(false);} }); }
+    function cDel(k){ return new Promise(function(res){ if(!db)return res();
+      try{ var tx=db.transaction('ctrl','readwrite'); tx.objectStore('ctrl').delete(k); tx.oncomplete=function(){res();}; tx.onerror=function(){res();}; }catch(e){res();} }); }
+    function cAll(){ return new Promise(function(res){ if(!db)return res([]);
+      try{ var tx=db.transaction('ctrl','readonly'); var rq=tx.objectStore('ctrl').getAll(); rq.onsuccess=function(){res(rq.result||[]);}; rq.onerror=function(){res([]);}; }catch(e){res([]);} }); }
 
-    // ===== GASへの送信（fetch・単純リクエストでプリフライト回避）=====
+    // ===== GASへの送信 =====
     function postJSON(payload){
       payload.token = TOKEN;
-      return fetch(API_URL, {
-        method:'POST',
-        headers:{ 'Content-Type':'text/plain;charset=utf-8' },  // ←application/jsonにするとプリフライトが出てGASで失敗する
-        body: JSON.stringify(payload),
-        redirect:'follow'
-      }).then(function(r){ return r.json(); });
+      if(payload.payloadSchemaVersion==null) payload.payloadSchemaVersion = 1;  // H7：欠落＝旧版(v1)として扱う（新payloadは明示的に2を付与済み）
+      return fetch(API_URL, { method:'POST', headers:{ 'Content-Type':'text/plain;charset=utf-8' }, body: JSON.stringify(payload), redirect:'follow' })
+        .then(function(r){ return r.json(); });
     }
 
     // ===== ユーティリティ =====
     function pad2(n){ return (n<10?'0':'')+n; }
     function fmtTime(ms){ var s=Math.floor(ms/1000); return pad2(Math.floor(s/60))+':'+pad2(s%60); }
-    function toast(m){ var t=$('toast'); t.textContent=m; t.classList.remove('hidden');
-      clearTimeout(t._h); t._h=setTimeout(function(){ t.classList.add('hidden'); },2500); }
-    function rand4(){ return Math.random().toString(36).slice(2,6); }
-    function blobToB64(blob){ return new Promise(function(res,rej){
-      var fr=new FileReader(); fr.onload=function(){ var s=fr.result; res(s.slice(s.indexOf(',')+1)); };
-      fr.onerror=rej; fr.readAsDataURL(blob); }); }
-    function pickMime(){ var c=['audio/mp4','audio/webm;codecs=opus','audio/webm','audio/mpeg'];
-      for(var i=0;i<c.length;i++){ try{ if(window.MediaRecorder && MediaRecorder.isTypeSupported(c[i])) return c[i]; }catch(e){} } return ''; }
-    function updateProgress(){ $('progress').textContent='送信済み '+acked+' / '+seq+' チャンク'+(pending.size?'（再送待ち '+pending.size+'）':''); }
+    function toast(m){ var t=$('toast'); t.textContent=m; t.classList.remove('hidden'); clearTimeout(t._h); t._h=setTimeout(function(){ t.classList.add('hidden'); },2800); }
+    function cryptoRandHex(nBytes){
+      try{ var a=new Uint8Array(nBytes); (window.crypto||window.msCrypto).getRandomValues(a); var s=''; for(var i=0;i<a.length;i++){ var h=a[i].toString(16); if(h.length<2)h='0'+h; s+=h; } return s; }
+      catch(e){ var f=Date.now().toString(16); for(var j=0;j<4;j++) f+=Math.random().toString(16).slice(2,6); return f.slice(0, Math.max(12, nBytes*2)); }  // C18：fallbackも十分な長さを確保
+    }
+    function blobToB64(blob){ return new Promise(function(res,rej){ var fr=new FileReader(); fr.onload=function(){ var s=fr.result; res(s.slice(s.indexOf(',')+1)); }; fr.onerror=rej; fr.readAsDataURL(blob); }); }
+    function pickMime(){ var c=['audio/mp4','audio/webm;codecs=opus','audio/webm','audio/mpeg']; for(var i=0;i<c.length;i++){ try{ if(window.MediaRecorder && MediaRecorder.isTypeSupported(c[i])) return c[i]; }catch(e){} } return ''; }
+    function updateProgress(){ $('progress').textContent='送信済み '+acked+' / '+seq+' チャンク'+(pending.size?'（再送待ち '+pending.size+'）':'')+(conflictCount?'（競合 '+conflictCount+'）':''); }
+
+    // pending管理（M17：oldestPendingAtで滞留判定）
+    function addPending(s){ pending.add(s); if(oldestPendingAt===0) oldestPendingAt=Date.now(); }
+    function removePending(s){ pending.delete(s); if(pending.size===0){ oldestPendingAt=0; clearUploadStallWarning(); if(finalizing) maybeFinalizePending(); } }  // C1：最後のchunkが捌けた瞬間に再finalizeを起動
 
     // ===== Wake Lock =====
     function requestWake(){ if(!('wakeLock' in navigator)){ $('wakeNote').classList.remove('hidden'); return; }
-      navigator.wakeLock.request('screen').then(function(wl){ wakeLock=wl; wakeLock.addEventListener('release',function(){ wakeLock=null; }); })
-      .catch(function(){ $('wakeNote').classList.remove('hidden'); }); }
+      navigator.wakeLock.request('screen').then(function(wl){ wakeLock=wl; wakeLock.addEventListener('release',function(){ wakeLock=null; }); }).catch(function(){ $('wakeNote').classList.remove('hidden'); }); }
     function releaseWake(){ try{ if(wakeLock){ wakeLock.release(); wakeLock=null; } }catch(e){} }
 
-    // ===== チャンク送信 =====
+    // ===== M16：audio track の mute/ended 監視（着信サイレント途切れの主要信号）=====
+    function attachTrackWatch(st){
+      try{ st.getAudioTracks().forEach(function(t){
+        t.onmute=function(){ if(recording && !userStopped) markInterrupt('track_mute','audio_track_muted'); };
+        t.onended=function(){ if(recording && !userStopped) markInterrupt('track_ended','audio_track_ended'); };
+      }); }catch(e){}
+    }
+
+    // ===== チャンク送信（B：per-chunk 観測時刻）=====
     function handleData(e){
       if(!e.data || e.data.size===0) return;
-      var s=seq++; pending.add(s); updateProgress();
-      blobToB64(e.data).then(function(b64){
-        return sendChunk({ action:'chunk', sessionId:sessionId, seq:s, mimeType:mimeType, u:SALES_KEY, dealName:dealName, dataB64:b64 });
+      var s=seq++; addPending(s); updateProgress();
+      var segRec=curSeg;
+      if(segRec){
+        segRec.seq=s; segRec.dataAvailableAt=nowISO(); segRec.monotonicData=mono();
+        segRec.blobEventTimecode=(typeof e.timecode==='number')?e.timecode:null; // セッション時刻軸には使わない
+        segRec.estDurationMs=estSegDurationMs(segRec);
+        segments.push(segRec);
+      }
+      lastDataAvailableAt=Date.now(); captureStallStrikes=0;
+      pendingBlobs[s]={ blob:e.data, segRec:segRec };   // #4：変換前にBlob参照を保持（変換失敗でも喪失しない）
+      convertAndSend(s);
+    }
+    // #4：Blob→Base64変換を捕捉付きで実行。失敗時はBlobを保持したまま再試行し、seqはpendingに残す（finalizeを完全扱いにしない）
+    function convertAndSend(s){
+      var rec=pendingBlobs[s]; if(!rec) return;
+      var segRec=rec.segRec;
+      blobToB64(rec.blob).then(function(b64){
+        delete pendingBlobs[s]; // 変換成功＝以降は既存の再送キュー(IndexedDB)がバイトを担保
+        return sendChunk({
+          action:'chunk', payloadSchemaVersion:PAYLOAD_SCHEMA_VERSION,
+          sessionId:sessionId, seq:s, mimeType:mimeType, u:SALES_KEY, dealName:dealName, dataB64:b64, clientSha256:null,
+          obs: segRec ? { segmentStartRequestedAt:segRec.segmentStartRequestedAt, recorderStartObservedAt:segRec.recorderStartObservedAt,
+            segmentStopRequestedAt:segRec.stopRequestedAt, recorderStopObservedAt:segRec.recorderStopObservedAt,
+            dataAvailableAt:segRec.dataAvailableAt, blobEventTimecode:segRec.blobEventTimecode,
+            clientEstimatedDurationMs:segRec.estDurationMs, stopReason:segRec.stopReason } : null,
+          monotonic: segRec ? segRec.monotonicData : mono()
+        });
+      }).catch(function(){
+        showConvertWarning();
+        setTimeout(function(){ convertAndSend(s); }, 3000); // 端末内Blobを保持して再変換
       });
+    }
+    function showConvertWarning(){ $('stallnote').classList.remove('hidden'); $('stallnote').textContent='⚠️ 音声データの変換に手間取っています。端末内に保持して再試行中です（画面は閉じないでください）。'; }
+    function estSegDurationMs(segRec){
+      var s=segRec.recorderStartObservedAt||segRec.segmentStartRequestedAt;
+      var e=segRec.stopRequestedAt||segRec.dataAvailableAt;   // C12思想：停止要求時刻を優先
+      if(!s||!e) return null; var d=new Date(e).getTime()-new Date(s).getTime(); return (d>0)?d:null;
     }
     function sendChunk(payload){
       var key=payload.sessionId+'_'+payload.seq;
       return postJSON(payload).then(function(r){
-        if(r && r.ok){ pending.delete(payload.seq); acked++; qDel(key); updateProgress(); }
-        else { throw new Error(r && r.error || 'unknown'); }
+        if(r && r.conflict){ // H9：サーバは旧partを保持。キューから外し競合として計上（喪失なし）
+          removePending(payload.seq); conflictCount++; lastServerAckAt=Date.now(); uploadStallStrikes=0; qDel(key); updateProgress();
+        } else if(r && r.ok){
+          removePending(payload.seq); acked++; lastServerAckAt=Date.now(); uploadStallStrikes=0; qDel(key); updateProgress();
+        } else { throw new Error(r && r.error || 'unknown'); }
       }).catch(function(){ qPut({key:key, sessionId:payload.sessionId, seq:payload.seq, payload:payload}); scheduleRetry(); updateProgress(); });
     }
 
@@ -195,7 +253,7 @@
     var retryTimer=null, retryDelay=2000;
     function scheduleRetry(){ if(retryTimer) return;
       retryTimer=setTimeout(function(){ retryTimer=null;
-        flushQueue().then(function(done){ if(!done){ retryDelay=Math.min(retryDelay*2,60000); scheduleRetry(); } else { retryDelay=2000; } });
+        flushQueue().then(function(done){ if(!done){ retryDelay=Math.min(retryDelay*2,60000); scheduleRetry(); } else { retryDelay=2000; maybeFinalizePending(); } });
       }, retryDelay); }
     function flushQueue(){
       return qAll().then(function(list){
@@ -203,8 +261,8 @@
         var chain=Promise.resolve();
         list.forEach(function(rec){ chain=chain.then(function(){
           return postJSON(rec.payload).then(function(r){
-            if(r && r.ok){
-              if(rec.sessionId===sessionId){ pending.delete(rec.seq); acked++; }  // 現セッションのカウンタだけ触る（過去セッション残骸で誤カウントしない）
+            if(r && (r.ok || r.conflict)){
+              if(rec.sessionId===sessionId){ removePending(rec.seq); if(r.ok) acked++; else if(r.conflict) conflictCount++; lastServerAckAt=Date.now(); }
               return qDel(rec.key);
             }
           }).catch(function(){});
@@ -212,7 +270,7 @@
         return chain.then(function(){ return qAll(); }).then(function(rest){ updateProgress(); return rest.length===0; });
       });
     }
-    window.addEventListener('online', function(){ $('netnote').textContent=''; retryDelay=2000; flushQueue(); });
+    window.addEventListener('online', function(){ $('netnote').textContent=''; retryDelay=2000; flushQueue().then(function(){ maybeFinalizePending(); }); });
     window.addEventListener('offline', function(){ $('netnote').textContent='📶 オフライン：録音は継続中。電波復帰後に自動送信します'; });
 
     // ===== 録音開始 =====
@@ -221,23 +279,20 @@
       dealName=($('deal').value||'').trim();
       mimeType=pickMime();
       navigator.mediaDevices.getUserMedia({audio:true}).then(function(st){
-        stream=st; startedAt=new Date(); var ts=startedAt;
+        stream=st; attachTrackWatch(st); startedAt=new Date(); stoppedAt=null; var ts=startedAt;
         var stamp=ts.getFullYear()+pad2(ts.getMonth()+1)+pad2(ts.getDate())+'_'+pad2(ts.getHours())+pad2(ts.getMinutes())+pad2(ts.getSeconds());
-        sessionId=stamp+'_'+(SALES_KEY||'x')+'_'+rand4()+rand4();  // 乱数8桁（他人セッションのsessionId推測・finalize妨害を困難に）
-        seq=0; acked=0; pending.clear(); userStopped=false; finalizing=false; interrupted=false;
+        sessionId=stamp+'_'+(SALES_KEY||'x')+'_'+cryptoRandHex(6);
+        seq=0; acked=0; conflictCount=0; pending.clear(); oldestPendingAt=0; userStopped=false; finalizing=false; interrupted=false;
+        segments=[]; interruptions=[]; curSeg=null; curInterruption=null;
         recording=true;
-        $('setupCard').classList.add('hidden'); $('recCard').classList.remove('hidden'); $('doneCard').classList.add('hidden');
+        $('setupCard').classList.add('hidden'); $('recCard').classList.remove('hidden'); $('doneCard').classList.add('hidden'); $('stallnote').classList.add('hidden');
         $('deal').disabled=true; requestWake(); startTimer();
-        startSegment();
-        // iOS Safari は timeslice を無視するため、30秒ごとに手動で区切って分割チャンク化する
+        lastDataAvailableAt=Date.now(); lastServerAckAt=Date.now(); captureStallStrikes=0; uploadStallStrikes=0;
+        startSegment(); startWatchdog();
         cycleTimer=setInterval(rotateSegment, SEG_MS);
-      }).catch(function(err){
-        recording=false;
-        alert('マイクにアクセスできませんでした。ブラウザのマイク許可を確認してください。\n'+err);
-      });
+      }).catch(function(err){ recording=false; alert('マイクにアクセスできませんでした。ブラウザのマイク許可を確認してください。\n'+err); });
     }
 
-    // 1セグメント＝1チャンク。stop()時にそのセグメント全体が ondataavailable で出る（iOS/Android共通で確実）
     function buildRecorder(){
       var opts={ audioBitsPerSecond:48000 };
       if(mimeType) opts.mimeType=mimeType;
@@ -245,42 +300,70 @@
       catch(e){ try{ recorder=new MediaRecorder(stream, mimeType?{mimeType:mimeType}:{}); }catch(e2){ recorder=new MediaRecorder(stream); } }
       if(!mimeType && recorder.mimeType) mimeType=recorder.mimeType;
       recorder.ondataavailable=handleData;
-      recorder.onerror=function(){ if(recording) markInterrupt(); };
+      recorder.onstart=function(){ if(curSeg && !curSeg.recorderStartObservedAt) curSeg.recorderStartObservedAt=nowISO(); }; // M15
+      recorder.onerror=function(){ if(recording) markInterrupt('recorder_onerror','recorder_error_event'); };
       recorder.onstop=onSegmentStop;
     }
     function startSegment(){
       buildRecorder();
-      try{ recorder.start(); }catch(e){ markInterrupt(); }
+      curSeg={ seq:null, segmentStartRequestedAt:nowISO(), recorderStartObservedAt:null, recorderStopObservedAt:null,
+               monotonicStart:mono(), monotonicData:null, stopRequestedAt:null, stopReason:null, dataAvailableAt:null, blobEventTimecode:null, estDurationMs:null };
+      try{ recorder.start(); if(!curSeg.recorderStartObservedAt) curSeg.recorderStartObservedAt=nowISO(); }
+      catch(e){ markInterrupt('recorder_start_error','start_exception'); }
     }
     function rotateSegment(){
-      // 30秒ごと：録音中なら現セグメントを閉じる（onSegmentStopで次を開始）
       if(recording && !interrupted && recorder && recorder.state==='recording'){
+        if(curSeg && !curSeg.stopReason){ curSeg.stopRequestedAt=nowISO(); curSeg.stopReason='rotate'; }
         try{ recorder.stop(); }catch(e){}
       }
     }
     function onSegmentStop(){
+      if(curSeg) curSeg.recorderStopObservedAt=nowISO(); // M15
       if(userStopped){ finalize(); return; }
       if(!recording) return;
-      if(document.visibilityState==='visible' && !interrupted){ startSegment(); }   // 次のセグメントへ
-      else { markInterrupt(); }
+      if(document.visibilityState==='visible' && !interrupted){ startSegment(); }
+      else { markInterrupt('segment_stop_unexpected','segment_stopped_hidden_or_interrupted'); }
     }
     function startTimer(){ clearInterval(timerId); timerId=setInterval(function(){ if(startedAt) $('time').textContent=fmtTime(Date.now()-startedAt.getTime()); },500); }
 
+    // ===== G：watchdog =====
+    function startWatchdog(){ stopWatchdog(); watchdogTimer=setInterval(watchdogTick, WATCHDOG_INTERVAL_MS); }
+    function stopWatchdog(){ if(watchdogTimer){ clearInterval(watchdogTimer); watchdogTimer=null; } captureStallStrikes=0; uploadStallStrikes=0; }
+    function watchdogTick(){
+      if(document.visibilityState!=='visible') return;
+      if(!recording || userStopped || interrupted){ captureStallStrikes=0; uploadStallStrikes=0; return; }
+      var now=Date.now();
+      if(now-lastDataAvailableAt > CAPTURE_STALL_MS){ captureStallStrikes++; } else { captureStallStrikes=0; }
+      if(captureStallStrikes>=2){ var secs=Math.round((now-lastDataAvailableAt)/1000); captureStallStrikes=0; markInterrupt('watchdog_capture_stall','no_dataavailable_'+secs+'s'); return; }
+      if(pending.size>0 && navigator.onLine && oldestPendingAt>0 && (now-oldestPendingAt > UPLOAD_STALL_MS)){ uploadStallStrikes++; } else { uploadStallStrikes=0; }
+      if(uploadStallStrikes>=2){ uploadStallStrikes=0; showUploadStallWarning(); }
+    }
+    function showUploadStallWarning(){ $('stallnote').classList.remove('hidden'); $('stallnote').textContent='⚠️ 送信が滞っています（録音は継続中）。電波状況を確認してください。未送信分は自動で再送されます。'; toast('送信が滞っています（録音は継続中）'); }
+    function clearUploadStallWarning(){ $('stallnote').classList.add('hidden'); $('stallnote').textContent=''; }
+    function showStorageWarning(){ $('stallnote').classList.remove('hidden'); $('stallnote').textContent='⚠️ 端末のストレージに保存できませんでした。録音後は必ず「保存しました」を確認してください（自動復旧できない場合があります）。'; }
+
     // ===== 中断・再開 =====
-    function markInterrupt(){
+    function markInterrupt(source, reason){
+      if(interrupted) return;
       interrupted=true;
-      // 中断時点までのバッファを確定させるため現recorderを閉じる（stopでondataavailableが発火し保存される）
+      if(curSeg && !curSeg.stopReason){ curSeg.stopReason='interrupt'; curSeg.stopRequestedAt=nowISO(); }
+      curInterruption={ detectedAt:nowISO(), detectedAtMonotonic:mono(), reason:reason||'unknown', detectionSource:source||'unknown', timingAccuracy:'approximate', resumedAt:null };
+      interruptions.push(curInterruption);
       try{ if(recorder && recorder.state==='recording') recorder.stop(); }catch(e){}
       $('interrupt').classList.remove('hidden');
     }
     function resumeRecording(){
       var alive=stream && stream.getAudioTracks().some(function(t){ return t.readyState==='live'; });
-      var proceed=alive?Promise.resolve(stream):navigator.mediaDevices.getUserMedia({audio:true}).then(function(st){ stream=st; return st; });
+      var proceed=alive?Promise.resolve(stream):navigator.mediaDevices.getUserMedia({audio:true}).then(function(st){ stream=st; attachTrackWatch(st); return st; });
       proceed.then(function(){
-        interrupted=false; recording=true;
+        var gapSecs=null;
+        if(curInterruption && !curInterruption.resumedAt){ curInterruption.resumedAt=nowISO(); gapSecs=Math.round((new Date(curInterruption.resumedAt).getTime()-new Date(curInterruption.detectedAt).getTime())/1000); }
+        curInterruption=null; interrupted=false; recording=true;
+        lastDataAvailableAt=Date.now(); captureStallStrikes=0;
         if(!cycleTimer) cycleTimer=setInterval(rotateSegment, SEG_MS);
         startSegment();
-        $('interrupt').classList.add('hidden'); requestWake(); toast('録音を再開しました');
+        $('interrupt').classList.add('hidden'); requestWake();
+        toast(gapSecs!=null ? ('録音を再開しました（約'+gapSecs+'秒間途切れ）') : '録音を再開しました');
       }).catch(function(){ alert('録音の再開に失敗しました。マイク許可を確認して、もう一度お試しください。'); });
     }
 
@@ -288,41 +371,110 @@
     function stopRecording(){
       if(!recording && !userStopped) return;
       userStopped=true; recording=false; interrupted=false;
-      clearInterval(cycleTimer); cycleTimer=null;
-      clearInterval(timerId); releaseWake();
+      stoppedAt=new Date();
+      if(curSeg && !curSeg.stopReason){ curSeg.stopReason='user_stop'; curSeg.stopRequestedAt=nowISO(); }
+      clearInterval(cycleTimer); cycleTimer=null; clearInterval(timerId); releaseWake(); stopWatchdog();
       $('interrupt').classList.add('hidden');
-      // 現セグメントを閉じる→onSegmentStopでfinalize（閉じられない状態なら直接finalize）
       try{ if(recorder && recorder.state!=='inactive') recorder.stop(); else finalize(); }catch(e){ finalize(); }
     }
+    function buildFinalizePayload(){
+      return {
+        action:'finalize', payloadSchemaVersion:PAYLOAD_SCHEMA_VERSION,
+        sessionId:sessionId, u:SALES_KEY, dealName:dealName,
+        sessionStartedAt: startedAt?startedAt.toISOString():null,
+        startedAt: startedAt?startedAt.toISOString():null,     // H8：旧サーバ互換（additive）
+        sessionStoppedAt: stoppedAt?stoppedAt.toISOString():null,
+        endedAt:null,
+        mimeType:mimeType, expectedChunks:seq, expectedCoverageMs: computeCoverageMs(),
+        captureIntervals: segments.map(function(s){ return { seq:s.seq, startedAtObserved:s.recorderStartObservedAt||s.segmentStartRequestedAt, stopRequestedAt:s.stopRequestedAt, recorderStopObservedAt:s.recorderStopObservedAt, dataAvailableAt:s.dataAvailableAt, stopReason:s.stopReason }; }),
+        interruptions: interruptions.map(function(it){ return { detectedAt:it.detectedAt, detectedAtMonotonic:it.detectedAtMonotonic, resumedAt:it.resumedAt, reason:it.reason, detectionSource:it.detectionSource, timingAccuracy:it.timingAccuracy }; }),
+        finalizeIntentId: sessionId, clientFinalizedAt: nowISO()
+      };
+    }
+    function computeCoverageMs(){ var sum=0; segments.forEach(function(s){ if(s.estDurationMs) sum+=s.estDurationMs; }); return sum; }
     function finalize(){
       if(finalizing) return; finalizing=true;
       try{ stream && stream.getTracks().forEach(function(t){ t.stop(); }); }catch(e){}
-      $('recLabel').textContent='アップロード中…'; $('stopBtn').disabled=true;
-      var wait=function(tries){
-        flushQueue().then(function(){
-          $('progress').textContent='アップロード中… 送信済み '+acked+' / '+seq+(pending.size?'（残り '+pending.size+'）':'');
-          if(pending.size===0 || tries<=0){ doFinalize(); } else { setTimeout(function(){ wait(tries-1); },2000); }
+      var fp=buildFinalizePayload();
+      $('recLabel').textContent='保存準備中…'; $('stopBtn').disabled=true;
+      // C2：finalize intent を「確実に」永続化してから進む（awaitし、失敗は明示）
+      cPut({ key:'finalize_'+sessionId, sessionId:sessionId, payload:fp, createdAt:Date.now() }).then(function(stored){
+        intentPersisted = !!stored;   // #3：保存可否を記録（showDoneの「閉じてOK/自動再試行」表示をこれで制御）
+        if(!stored) showStorageWarning();
+        $('recLabel').textContent='アップロード中…';
+        var wait=function(tries){
+          flushQueue().then(function(){
+            $('progress').textContent='アップロード中… 送信済み '+acked+' / '+seq+(pending.size?'（残り '+pending.size+'）':'');
+            if(pending.size===0 || tries<=0){ doFinalize(fp); } else { setTimeout(function(){ wait(tries-1); },2000); }
+          });
+        };
+        wait(40);
+      });
+    }
+    function doFinalize(fp){
+      fp.endedAt=new Date().toISOString();
+      postJSON(fp).then(function(r){
+        if(!r || !r.ok){ scheduleFinalizeRetry(); }                    // 通信/lock失敗：intent保持で再試行
+        else if(r.retryNeeded===true){ scheduleFinalizeRetry(); }      // #7 stabilizing：遅延chunk合流待ち＝再finalize
+        else { cDel('finalize_'+fp.sessionId); clearFinalizeRetry(); } // complete or terminal incomplete：永久再試行しない（terminalは要確認で残す）
+        showDone(r);
+      }).catch(function(e){ scheduleFinalizeRetry(); showDone({ok:false,error:String(e)}); });
+    }
+
+    // H10：finalize 専用リトライ（chunk送信済みでもlock競合/未完なら自動で再finalize）
+    var finalizeRetryTimer=null, finalizeRetryDelay=5000;
+    function scheduleFinalizeRetry(){ if(finalizeRetryTimer) return;
+      finalizeRetryTimer=setTimeout(function(){ finalizeRetryTimer=null;
+        maybeFinalizePending().then(function(){ cAll().then(function(x){ if(x&&x.length){ finalizeRetryDelay=Math.min(finalizeRetryDelay*2,60000); scheduleFinalizeRetry(); } else { finalizeRetryDelay=5000; } }); });
+      }, finalizeRetryDelay); }
+    function clearFinalizeRetry(){ if(finalizeRetryTimer){ clearTimeout(finalizeRetryTimer); finalizeRetryTimer=null; } finalizeRetryDelay=5000; }
+
+    // H/C1：未完了の finalize intent を、当該セッションの未送信chunkが捌けていれば冪等再送。完全になるまで intent は残す。
+    function maybeFinalizePending(){
+      if(!db) return Promise.resolve();
+      return cAll().then(function(intents){
+        if(!intents || !intents.length) return;
+        return qAll().then(function(pendings){
+          var chain=Promise.resolve();
+          intents.forEach(function(intent){ chain=chain.then(function(){
+            if(pendings.some(function(p){ return p.sessionId===intent.sessionId; })) return; // chunkが残っている間は待つ
+            var fp=intent.payload; fp.endedAt=new Date().toISOString();
+            return postJSON(fp).then(function(r){ if(r && r.ok && r.retryNeeded!==true){ return cDel('finalize_'+intent.sessionId); } }).catch(function(){}); // #7：complete/terminalは削除・stabilizingのみ保持
+          }); });
+          return chain;
         });
-      };
-      wait(40);
+      });
     }
-    function doFinalize(){
-      var payload={ action:'finalize', sessionId:sessionId, u:SALES_KEY, dealName:dealName,
-        startedAt: startedAt?startedAt.toISOString():new Date().toISOString(), endedAt:new Date().toISOString(),
-        mimeType:mimeType, expectedChunks:seq };
-      postJSON(payload).then(function(r){ showDone(r); }).catch(function(e){ showDone({ok:false,error:String(e)}); });
-    }
+
     function showDone(r){
       $('recCard').classList.add('hidden'); $('doneCard').classList.remove('hidden');
+      // #3：intent保存に失敗しているときは「閉じてOK/自動再試行」を約束しない
+      var closeOk = intentPersisted ? '（この画面は閉じてOK）' : '（⚠️ 端末に再送情報を保存できていません。<b>この画面を閉じないでください</b>）';
       var html='';
       if(r && r.ok){
-        html+='✅ 録音を保存しました。<br>';
+        var complete = r.completionState==='complete';
+        var stabilizing = r.retryNeeded===true;   // #7：遅延chunk合流待ち（回復し得る）
+        if(complete){ html+='✅ 録音を保存しました（欠落なし）。<br>'; }
+        else if(stabilizing){ html+='⏳ 保存しました（一部未到達）。<br>'; }
+        else { html+='⚠️ 保存しました（欠落あり・要確認）。<br>'; }
         html+='フォルダ名：<b>'+(r.folderName||'')+'</b><br>';
         html+='保存チャンク数：'+(r.chunkCount||0)+'（30秒ごと）<br>';
-        if(r.missingSeqs && r.missingSeqs.length){ html+='<span class="warnline">⚠️ 欠番あり：'+r.missingSeqs.join(',')+'（夏川に連絡）</span><br>'; }
-        else { html+='欠番なし ✅<br>'; }
+        if(r.revision){ html+='版：r'+r.revision+'（'+(r.completionState||'')+'）<br>'; }
+        if(stabilizing){
+          html+='<span class="warnline">⏳ 未到達のチャンクがあります。電波が戻れば自動で追送・再確定します'+closeOk+'。</span><br>';
+        } else if(!complete){
+          html+='<span class="warnline">⚠️ 欠落を確定検知';
+          if(r.reasonCodes && r.reasonCodes.length){ html+='（理由：'+r.reasonCodes.join(',')+'）'; }
+          if(r.missingSeqs && r.missingSeqs.length){ html+='（欠番：'+r.missingSeqs.join(',')+'）'; }
+          html+='。自動修復はできません。夏川に連絡してください。</span><br>';
+        }
+        if(r.conflicts && r.conflicts.length){ html+='<span class="warnline">⚠️ 内容の異なる重複送信を検知（サーバ側で旧データ保持済み・要確認）</span><br>'; }
+      } else if(r && r.retryable){
+        html+='<span class="warnline">⏳ サーバが混み合っています（順番待ち）。</span><br>チャンクはDriveに保存済みです。自動で再試行します'+closeOk+'。夏川に連絡してください。<br>詳細：'+(r.error||'lock_unavailable');
       } else {
-        html+='<span class="warnline">⚠️ finalizeでエラーが発生しました。</span><br>ただしチャンクはDriveの _sessions に保存済みの可能性があります。<br>夏川に連絡してください。<br>詳細：'+(r && r.error || '不明');
+        html+='<span class="warnline">⚠️ finalizeでエラーが発生しました。</span><br>チャンクはDriveの _sessions に保存済みの可能性があります。';
+        html+= intentPersisted ? '<br>この画面を開いたまま、または開き直すと自動で再送を試みます。' : '<br>⚠️ <b>この画面を閉じないでください</b>（端末に再送情報を保存できていません）。';
+        html+='<br>夏川に連絡してください。<br>詳細：'+(r && r.error || '不明');
       }
       $('doneMsg').innerHTML=html; $('stopBtn').disabled=false;
     }
@@ -330,11 +482,11 @@
     // ===== visibility =====
     document.addEventListener('visibilitychange', function(){
       if(document.visibilityState==='hidden' && recording && !userStopped){
-        // 裏に回った/画面が消えた＝iOSはこの間録音しない。即座に中断扱いにして復帰時に気づかせる
-        markInterrupt();
+        markInterrupt('visibilitychange_hidden','app_backgrounded_or_screen_off');
       } else if(document.visibilityState==='visible' && recording && !userStopped){
         requestWake();
-        if(interrupted || (recorder && recorder.state==='inactive')) markInterrupt();
+        if(interrupted){ $('interrupt').classList.remove('hidden'); }
+        else if(recorder && recorder.state==='inactive'){ markInterrupt('visibilitychange_visible_inactive','recorder_inactive_on_resume'); }
       }
     });
 
@@ -345,10 +497,11 @@
     $('againBtn').addEventListener('click', function(){
       $('deal').disabled=false; $('deal').value='';
       $('doneCard').classList.add('hidden'); $('setupCard').classList.remove('hidden');
-      $('time').textContent='00:00'; $('progress').textContent='送信済み 0 / 0 チャンク'; $('netnote').textContent='';
+      $('time').textContent='00:00'; $('progress').textContent='送信済み 0 / 0 チャンク'; $('netnote').textContent=''; clearUploadStallWarning();
     });
 
-    openDB().then(function(d){ db=d; return flushQueue(); });
+    // 起動時：DB → 未送信chunk flush → 未完了finalize intentの冪等再送（完全になるまで保持）
+    openDB().then(function(d){ db=d; return flushQueue(); }).then(function(){ return maybeFinalizePending(); }).then(function(){ cAll().then(function(x){ if(x && x.length) scheduleFinalizeRetry(); }); });
   </script>
 </body>
 </html>
