@@ -439,7 +439,7 @@
         else if(r.retryNeeded===true){ scheduleFinalizeRetry(); }      // #7 stabilizing：遅延chunk合流待ち＝再finalize
         else { finalizeSettled(fp.sessionId); }                        // complete or terminal incomplete：このsessionのintentを消す（他sessionの再試行は止めない＝v0.6.5 high2）
         showDone(r);
-      }).catch(function(e){ finalizePostInFlight=false; scheduleFinalizeRetry(); showDone({ok:false,error:String(e)}); });
+      }).catch(function(e){ finalizePostInFlight=false; scheduleFinalizeRetry(); showDone({ok:false,processing:true,error:String(e)}); }); // v0.6.5d：timeout/切断は失敗でなく「処理中」（サーバは継続・retryで確定）
     }
 
     // H10：finalize 専用リトライ（chunk送信済みでもlock競合/未完なら自動で再finalize）
@@ -477,7 +477,13 @@
             if(finalizePostInFlight) return;                 // v0.6.4：直前のintent処理が飛行中ならスキップ（単一飛行）
             finalizePostInFlight=true;
             var fp=intent.payload; fp.endedAt=new Date().toISOString();
-            return postFinalizeJSON(fp).then(function(r){ finalizePostInFlight=false; if(r && r.ok && r.retryNeeded!==true){ return cDel('finalize_'+intent.sessionId); } }).catch(function(){ finalizePostInFlight=false; }); // #7：complete/terminalは削除・stabilizingのみ保持（v0.6.5：Abort期限付き）
+            return postFinalizeJSON(fp).then(function(r){
+              finalizePostInFlight=false;
+              if(r && r.ok){
+                if(intent.sessionId===sessionId){ showDone(r); }        // v0.6.5d：現在のsessionがretryで確定したらUIを更新（「処理中」表示のまま放置しない）
+                if(r.retryNeeded!==true){ return cDel('finalize_'+intent.sessionId); } // #7：complete/terminalは削除・stabilizingのみ保持
+              }
+            }).catch(function(){ finalizePostInFlight=false; }); // v0.6.5：Abort期限付き
           }); });
           return chain;
         });
@@ -507,8 +513,10 @@
           html+='。自動修復はできません。夏川に連絡してください。</span><br>';
         }
         if(r.conflicts && r.conflicts.length){ html+='<span class="warnline">⚠️ 内容の異なる重複送信を検知（サーバ側で旧データ保持済み・要確認）</span><br>'; }
-      } else if(r && r.retryable){
-        html+='<span class="warnline">⏳ サーバが混み合っています（順番待ち）。</span><br>チャンクはDriveに保存済みです。自動で再試行します'+closeOk+'。夏川に連絡してください。<br>詳細：'+(r.error||'lock_unavailable');
+      } else if(r && (r.retryable || r.processing)){
+        // v0.6.5d：lock_unavailable（先行finalizeが長時間処理中）や、クライアントfetchのタイムアウト/切断。
+        //   長い録音はサーバ確定に数分かかる＝失敗ではない。録音は端末＋Driveに保持済みで、自動で再確認して確定する。
+        html+='<span class="warnline">⏳ サーバで保存処理中です。</span><br>大きい録音（長い商談）は確定に数分かかることがあります。<br>録音は端末とDriveに保持されています。<b>このままお待ちください</b>（自動で再確認して確定します'+closeOk+'）。<br>詳細：'+(r.error||(r.retryable?'lock_unavailable':'timeout'));
       } else {
         html+='<span class="warnline">⚠️ finalizeでエラーが発生しました。</span><br>チャンクはDriveの _sessions に保存済みの可能性があります。';
         html+= intentPersisted ? '<br>この画面を開いたまま、または開き直すと自動で再送を試みます。' : '<br>⚠️ <b>この画面を閉じないでください</b>（端末に再送情報を保存できていません）。';
