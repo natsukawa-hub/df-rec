@@ -105,6 +105,9 @@
     var sessionId='', startedAt=null, stoppedAt=null, dealName='';
     var seq=0, acked=0, conflictCount=0, pending=new Set();
     var recording=false, userStopped=false, finalizing=false;
+    // v0.6.4：finalize の単一飛行（2往復＝doFinalize と C1 maybeFinalizePending の同時POSTを抑止し lock_unavailable を根絶）
+    var finalizePostInFlight=false;   // finalize POST が1本でも飛行中か（doFinalize/maybeFinalizePending 共通ガード）
+    var primaryFinalizePosted=false;  // 一次finalize(doFinalize)を1回以上POST済みか（初回waitループ中はC1の自動再finalizeを抑止）
     var wakeLock=null, timerId=null, db=null;
     var cycleTimer=null, SEG_MS=30000, interrupted=false;
 
@@ -117,6 +120,7 @@
     var lastDataAvailableAt=0, lastServerAckAt=0, oldestPendingAt=0, watchdogTimer=null;
     var captureStallStrikes=0, uploadStallStrikes=0;
     var CAPTURE_STALL_MS=60000, UPLOAD_STALL_MS=90000, WATCHDOG_INTERVAL_MS=15000;
+    var FINALIZE_TIMEOUT_MS=90000; // v0.6.5：finalize POSTがsettleしない(blackhole)ときの上限。超過でabort→ラッチ解放＋再試行（サーバ冪等なので安全）
 
     var $=function(id){ return document.getElementById(id); };
 
@@ -159,13 +163,24 @@
       try{ var tx=db.transaction('ctrl','readwrite'); tx.objectStore('ctrl').delete(k); tx.oncomplete=function(){res();}; tx.onerror=function(){res();}; }catch(e){res();} }); }
     function cAll(){ return new Promise(function(res){ if(!db)return res([]);
       try{ var tx=db.transaction('ctrl','readonly'); var rq=tx.objectStore('ctrl').getAll(); rq.onsuccess=function(){res(rq.result||[]);}; rq.onerror=function(){res([]);}; }catch(e){res([]);} }); }
+    // v0.6.5c（Codex adversarial#v065-high1）：cAll は障害でも [] を返すため「確定的に空」と「読取障害」を区別できない。
+    //   retry継続判定用に、DB未接続/例外/request失敗を null（＝不明）で返す版を用意する（空配列[]＝確定的に空とは別物）。
+    function cAllOrNull(){ return new Promise(function(res){ if(!db)return res(null);
+      try{ var tx=db.transaction('ctrl','readonly'); var rq=tx.objectStore('ctrl').getAll(); rq.onsuccess=function(){res(rq.result||[]);}; rq.onerror=function(){res(null);}; }catch(e){res(null);} }); }
 
     // ===== GASへの送信 =====
-    function postJSON(payload){
+    function postJSON(payload, signal){
       payload.token = TOKEN;
       if(payload.payloadSchemaVersion==null) payload.payloadSchemaVersion = 1;  // H7：欠落＝旧版(v1)として扱う（新payloadは明示的に2を付与済み）
-      return fetch(API_URL, { method:'POST', headers:{ 'Content-Type':'text/plain;charset=utf-8' }, body: JSON.stringify(payload), redirect:'follow' })
-        .then(function(r){ return r.json(); });
+      var opts = { method:'POST', headers:{ 'Content-Type':'text/plain;charset=utf-8' }, body: JSON.stringify(payload), redirect:'follow' };
+      if(signal) opts.signal = signal;  // v0.6.5：finalizeはAbortタイムアウトを渡す（hung fetchでラッチが永久固定するのを防ぐ）
+      return fetch(API_URL, opts).then(function(r){ return r.json(); });
+    }
+    // v0.6.5：finalize専用POST（AbortController＋期限）。期限超過でabort→rejectし、呼び出し側の.catchでラッチ解放＋再試行させる。
+    function postFinalizeJSON(fp){
+      var ctrl = ('AbortController' in window) ? new AbortController() : null;
+      var to = ctrl ? setTimeout(function(){ try{ ctrl.abort(); }catch(e){} }, FINALIZE_TIMEOUT_MS) : null;
+      return postJSON(fp, ctrl && ctrl.signal).then(function(r){ if(to) clearTimeout(to); return r; }, function(e){ if(to) clearTimeout(to); throw e; });
     }
 
     // ===== ユーティリティ =====
@@ -182,7 +197,9 @@
 
     // pending管理（M17：oldestPendingAtで滞留判定）
     function addPending(s){ pending.add(s); if(oldestPendingAt===0) oldestPendingAt=Date.now(); }
-    function removePending(s){ pending.delete(s); if(pending.size===0){ oldestPendingAt=0; clearUploadStallWarning(); if(finalizing) maybeFinalizePending(); } }  // C1：最後のchunkが捌けた瞬間に再finalizeを起動
+    // C1：最後のchunkが捌けた瞬間に再finalizeを起動。ただし v0.6.4：一次finalizeをまだPOSTしていない初回waitループ中は起動しない
+    // （直後に doFinalize が走るため二重POST＝lock競合になる）。一次POST後の遅延chunk合流のときだけ maybeFinalizePending を呼ぶ。
+    function removePending(s){ pending.delete(s); if(pending.size===0){ oldestPendingAt=0; clearUploadStallWarning(); if(finalizing && primaryFinalizePosted && !finalizePostInFlight) maybeFinalizePending(); } }
 
     // ===== Wake Lock =====
     function requestWake(){ if(!('wakeLock' in navigator)){ $('wakeNote').classList.remove('hidden'); return; }
@@ -283,6 +300,7 @@
         var stamp=ts.getFullYear()+pad2(ts.getMonth()+1)+pad2(ts.getDate())+'_'+pad2(ts.getHours())+pad2(ts.getMinutes())+pad2(ts.getSeconds());
         sessionId=stamp+'_'+(SALES_KEY||'x')+'_'+cryptoRandHex(6);
         seq=0; acked=0; conflictCount=0; pending.clear(); oldestPendingAt=0; userStopped=false; finalizing=false; interrupted=false;
+        finalizePostInFlight=false; primaryFinalizePosted=false; finalizeRetryRounds=0; // v0.6.4/6.5c：連続録音で単一飛行フラグ／retry上限カウンタを持ち越さない
         segments=[]; interruptions=[]; curSeg=null; curInterruption=null;
         recording=true;
         $('setupCard').classList.add('hidden'); $('recCard').classList.remove('hidden'); $('doneCard').classList.add('hidden'); $('stallnote').classList.add('hidden');
@@ -412,34 +430,54 @@
       });
     }
     function doFinalize(fp){
+      if(finalizePostInFlight) return;                    // v0.6.4：単一飛行（別のfinalize POSTが飛行中なら重複POSTしない）
+      finalizePostInFlight=true; primaryFinalizePosted=true;
       fp.endedAt=new Date().toISOString();
-      postJSON(fp).then(function(r){
+      postFinalizeJSON(fp).then(function(r){               // v0.6.5：Abort期限付き（hung fetchでラッチ固定を防ぐ）
+        finalizePostInFlight=false;
         if(!r || !r.ok){ scheduleFinalizeRetry(); }                    // 通信/lock失敗：intent保持で再試行
         else if(r.retryNeeded===true){ scheduleFinalizeRetry(); }      // #7 stabilizing：遅延chunk合流待ち＝再finalize
-        else { cDel('finalize_'+fp.sessionId); clearFinalizeRetry(); } // complete or terminal incomplete：永久再試行しない（terminalは要確認で残す）
+        else { finalizeSettled(fp.sessionId); }                        // complete or terminal incomplete：このsessionのintentを消す（他sessionの再試行は止めない＝v0.6.5 high2）
         showDone(r);
-      }).catch(function(e){ scheduleFinalizeRetry(); showDone({ok:false,error:String(e)}); });
+      }).catch(function(e){ finalizePostInFlight=false; scheduleFinalizeRetry(); showDone({ok:false,error:String(e)}); });
     }
 
     // H10：finalize 専用リトライ（chunk送信済みでもlock競合/未完なら自動で再finalize）
-    var finalizeRetryTimer=null, finalizeRetryDelay=5000;
+    var finalizeRetryTimer=null, finalizeRetryDelay=5000, finalizeRetryRounds=0, FINALIZE_RETRY_MAX=20;
     function scheduleFinalizeRetry(){ if(finalizeRetryTimer) return;
       finalizeRetryTimer=setTimeout(function(){ finalizeRetryTimer=null;
-        maybeFinalizePending().then(function(){ cAll().then(function(x){ if(x&&x.length){ finalizeRetryDelay=Math.min(finalizeRetryDelay*2,60000); scheduleFinalizeRetry(); } else { finalizeRetryDelay=5000; } }); });
+        maybeFinalizePending().then(function(){ cAllOrNull().then(function(x){
+          // v0.6.5c（Codex adversarial#v065-high1）：x===null＝IndexedDB障害（不明）→安全側で継続。x.length>0＝intent残存→継続。
+          //   []＝確定的に空→終了（reset）。無限retry防止に上限を設け、超過したら停止して reopen 再開へ委ねる（timerは背景化で凍結もされる）。
+          var keepRetry = (x === null) || (x && x.length > 0);
+          if(keepRetry){
+            if(finalizeRetryRounds < FINALIZE_RETRY_MAX){ finalizeRetryRounds++; finalizeRetryDelay=Math.min(finalizeRetryDelay*2,60000); scheduleFinalizeRetry(); }
+            else { toast('未確定の録音があります。アプリを開き直すと自動で再確定します'); } // 上限到達＝ループ停止（reopen/onlineで再開）
+          } else { finalizeRetryDelay=5000; finalizeRetryRounds=0; } // 確定的に空＝正常終了
+        }); });
       }, finalizeRetryDelay); }
-    function clearFinalizeRetry(){ if(finalizeRetryTimer){ clearTimeout(finalizeRetryTimer); finalizeRetryTimer=null; } finalizeRetryDelay=5000; }
+    // v0.6.5b（Codex adversarial#v065-high2）：あるsessionのfinalize確定(complete/terminal)時、そのsessionのintentだけ消して
+    //   retryを再スケジュールする。★retryタイマーを明示clearしない：cAll()はIndexedDB例外でも[]を返すため、[]根拠でclearすると
+    //   障害時に他sessionのintent（例：A=stabilizing中にB=complete）のretryを誤って止める（前回high2の残存経路）。
+    //   停止は scheduleFinalizeRetry のコールバックの再arm判定（cAllが空なら再armしない＝自然終了）に委ね、空判定を破壊的操作に使わない。
+    function finalizeSettled(sessionId){
+      cDel('finalize_'+sessionId).then(function(){ scheduleFinalizeRetry(); });
+    }
 
     // H/C1：未完了の finalize intent を、当該セッションの未送信chunkが捌けていれば冪等再送。完全になるまで intent は残す。
     function maybeFinalizePending(){
       if(!db) return Promise.resolve();
+      if(finalizePostInFlight) return Promise.resolve();   // v0.6.4：doFinalize等のfinalize POSTが飛行中ならスキップ（重複POST＝lock競合を防ぐ）
       return cAll().then(function(intents){
         if(!intents || !intents.length) return;
         return qAll().then(function(pendings){
           var chain=Promise.resolve();
           intents.forEach(function(intent){ chain=chain.then(function(){
             if(pendings.some(function(p){ return p.sessionId===intent.sessionId; })) return; // chunkが残っている間は待つ
+            if(finalizePostInFlight) return;                 // v0.6.4：直前のintent処理が飛行中ならスキップ（単一飛行）
+            finalizePostInFlight=true;
             var fp=intent.payload; fp.endedAt=new Date().toISOString();
-            return postJSON(fp).then(function(r){ if(r && r.ok && r.retryNeeded!==true){ return cDel('finalize_'+intent.sessionId); } }).catch(function(){}); // #7：complete/terminalは削除・stabilizingのみ保持
+            return postFinalizeJSON(fp).then(function(r){ finalizePostInFlight=false; if(r && r.ok && r.retryNeeded!==true){ return cDel('finalize_'+intent.sessionId); } }).catch(function(){ finalizePostInFlight=false; }); // #7：complete/terminalは削除・stabilizingのみ保持（v0.6.5：Abort期限付き）
           }); });
           return chain;
         });
