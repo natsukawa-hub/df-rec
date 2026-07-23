@@ -93,13 +93,16 @@
 
   <div id="interrupt" class="hidden">
     <div class="big">⚠️ 録音停止中</div>
-    <div class="msg">録音が中断されました。<br><b>画面を消す・他アプリに移ると、その間は録音されません。</b><br>画面はこのまま点けておいてください。<br>下のボタンで再開できます（ここまでの分は保存済み）。</div>
+    <div class="msg">録音が中断されました。<b>自動で再開を試みています…</b><br>すぐに戻らない場合は下のボタンを押してください（ここまでの分は保存済み）。<br><b>画面を消す・他アプリに移ると、その間は録音されません。</b></div>
     <button id="resumeBtn">録音を再開する</button>
   </div>
 
   <div id="toast" class="hidden"></div>
 
   <script>
+    // CLIENT_VERSION v0.7.2 stall-resilience（2026-07-23）＝中断の自動再開＋中断スパン整形（coverage正直化）＋watchdog高速化＋mute猶予＋audioSessionフック
+    //   背景：iOS26で画面ON・前面でもMediaRecorderが約90秒stallし（2026-07-22 阿部）、検知遅延の死に区間が誰にも説明されず
+    //   silent_gap＝終端incompleteに落ちる構造穴があった。設計正本＝design_v0.7.2_stall-resilience.md
     // ================== 設定（デプロイ時にここだけ書き換える） ==================
     var API_URL = 'https://script.google.com/macros/s/AKfycbyvjG0sKZnQ_RZz1f5WoNeI_m52rebQT2VLPdvnm5jBXPgrykBbNxY3GhIe9EeNZ6dQOA/exec';
     var TOKEN   = 'df-rec-7gljy_kPxnAmM0FgJ87lGf0A';
@@ -128,7 +131,13 @@
     // G：watchdog
     var lastDataAvailableAt=0, lastServerAckAt=0, oldestPendingAt=0, watchdogTimer=null;
     var captureStallStrikes=0, uploadStallStrikes=0;
-    var CAPTURE_STALL_MS=60000, UPLOAD_STALL_MS=90000, WATCHDOG_INTERVAL_MS=15000;
+    // v0.7.2：capture stall＝40s×1ストライク×10s tick＝最悪約50秒で検知（旧60s×2×15s＝約90秒）。
+    //   誤検知のコストは「flush→自動再開」の一瞬に下がった（自動再開＋中断スパン整形が後始末する）ので早め倒しに変更。
+    var CAPTURE_STALL_MS=40000, UPLOAD_STALL_MS=90000, WATCHDOG_INTERVAL_MS=10000;
+    // v0.7.2：中断の自動再開（stall-resilience）。mute猶予／自動getUserMedia再取得のバックオフ／pending固着の自己回復。
+    var MUTE_GRACE_MS=5000, AUTO_RESUME_BASE_MS=1500, AUTO_RESUME_MAX_MS=15000, AUTO_RESUME_STUCK_MS=45000;
+    var muteGraceTimer=null, autoResumeTimer=null, autoResumeDelay=AUTO_RESUME_BASE_MS, autoResumeInFlight=false, autoResumeStartedAt=0, resumeGen=0;
+    var forceFreshStream=false;   // v0.7.2：捕捉死系の中断（stall/ended/mute超過/audiosession）は「liveに見える」旧トラックも信用せず必ず取り直す
     var FINALIZE_TIMEOUT_MS=90000; // v0.6.5：finalize POSTがsettleしない(blackhole)ときの上限。超過でabort→ラッチ解放＋再試行（サーバ冪等なので安全）
 
     var $=function(id){ return document.getElementById(id); };
@@ -215,11 +224,23 @@
       navigator.wakeLock.request('screen').then(function(wl){ wakeLock=wl; wakeLock.addEventListener('release',function(){ wakeLock=null; }); }).catch(function(){ $('wakeNote').classList.remove('hidden'); }); }
     function releaseWake(){ try{ if(wakeLock){ wakeLock.release(); wakeLock=null; } }catch(e){} }
 
-    // ===== M16：audio track の mute/ended 監視（着信サイレント途切れの主要信号）=====
+    // ===== M16/v0.7.2：audio track の mute/ended 監視（着信・Siri・音声セッション中断の主要信号）=====
+    //   mute は一過性（Siri・経路切替）が多い→MUTE_GRACE_MS だけ様子見し、unmute なら無傷復帰（recorderは止めない）。
+    //   猶予を超えて muted のままなら中断化→自動再開（fresh getUserMedia）。ended は即中断化。
     function attachTrackWatch(st){
       try{ st.getAudioTracks().forEach(function(t){
-        t.onmute=function(){ if(recording && !userStopped) markInterrupt('track_mute','audio_track_muted'); };
-        t.onended=function(){ if(recording && !userStopped) markInterrupt('track_ended','audio_track_ended'); };
+        t.onmute=function(){
+          if(!recording || userStopped || interrupted || muteGraceTimer) return;
+          var mutedAtISO=nowISO();
+          muteGraceTimer=setTimeout(function(){
+            muteGraceTimer=null;
+            if(recording && !userStopped && !interrupted && t.muted){
+              markInterrupt('track_mute','audio_track_muted_over_'+Math.round(MUTE_GRACE_MS/1000)+'s', mutedAtISO);
+            }
+          }, MUTE_GRACE_MS);
+        };
+        t.onunmute=function(){ if(muteGraceTimer){ clearTimeout(muteGraceTimer); muteGraceTimer=null; } };
+        t.onended=function(){ if(muteGraceTimer){ clearTimeout(muteGraceTimer); muteGraceTimer=null; } if(recording && !userStopped) markInterrupt('track_ended','audio_track_ended'); };
       }); }catch(e){}
     }
 
@@ -227,7 +248,10 @@
     function handleData(e){
       if(!e.data || e.data.size===0) return;
       var s=seq++; addPending(s); updateProgress();
-      var segRec=curSeg;
+      // v0.7.2：dataは「それを生んだrecorder自身のセグメント」に紐付ける。中断→自動再開後に旧recorderの遅延flushが
+      //   新curSegへ誤紐付けされると、録音区間の二重計上（overlapping_intervals＝終端incomplete）や取り違えが起きるため。
+      var segRec=(e && e.target && e.target._segRec) || curSeg;
+      if(segRec && segRec.seq!=null) segRec=null;   // 同一セグメント2発目のdata（想定外）＝区間を二重計上しない（chunk送信はする）
       if(segRec){
         segRec.seq=s; segRec.dataAvailableAt=nowISO(); segRec.monotonicData=mono();
         segRec.blobEventTimecode=(typeof e.timecode==='number')?e.timecode:null; // セッション時刻軸には使わない
@@ -304,6 +328,7 @@
       if(API_URL.indexOf('PASTE_')===0 || TOKEN.indexOf('CHANGE-ME')>=0){ alert('セットアップ未完了：API_URL / TOKEN を設定してください。'); return; }
       dealName=($('deal').value||'').trim();
       mimeType=pickMime();
+      try{ if(navigator.audioSession) navigator.audioSession.type='play-and-record'; }catch(e){} // v0.7.2：音声セッション用途を録音向けに固定（対応環境のみ・中断復帰の安定化）
       navigator.mediaDevices.getUserMedia({audio:true}).then(function(st){
         stream=st; attachTrackWatch(st); startedAt=new Date(); stoppedAt=null; var ts=startedAt;
         var stamp=ts.getFullYear()+pad2(ts.getMonth()+1)+pad2(ts.getDate())+'_'+pad2(ts.getHours())+pad2(ts.getMinutes())+pad2(ts.getSeconds());
@@ -311,6 +336,9 @@
         seq=0; acked=0; conflictCount=0; pending.clear(); oldestPendingAt=0; userStopped=false; finalizing=false; interrupted=false;
         finalizePostInFlight=false; primaryFinalizePosted=false; finalizeRetryRounds=0; // v0.6.4/6.5c：連続録音で単一飛行フラグ／retry上限カウンタを持ち越さない
         segments=[]; interruptions=[]; curSeg=null; curInterruption=null;
+        resumeGen++; autoResumeDelay=AUTO_RESUME_BASE_MS; autoResumeInFlight=false; autoResumeStartedAt=0; forceFreshStream=false; // v0.7.2：前回録音の再開試行を持ち越さない
+        if(autoResumeTimer){ clearTimeout(autoResumeTimer); autoResumeTimer=null; }
+        if(muteGraceTimer){ clearTimeout(muteGraceTimer); muteGraceTimer=null; }
         recording=true;
         $('setupCard').classList.add('hidden'); $('recCard').classList.remove('hidden'); $('doneCard').classList.add('hidden'); $('stallnote').classList.add('hidden');
         $('deal').disabled=true; requestWake(); startTimer();
@@ -335,6 +363,7 @@
       buildRecorder();
       curSeg={ seq:null, segmentStartRequestedAt:nowISO(), recorderStartObservedAt:null, recorderStopObservedAt:null,
                monotonicStart:mono(), monotonicData:null, stopRequestedAt:null, stopReason:null, dataAvailableAt:null, blobEventTimecode:null, estDurationMs:null };
+      try{ recorder._segRec=curSeg; }catch(e){}   // v0.7.2：data/stopイベントを生んだrecorder自身のセグメントを引けるように
       try{ recorder.start(); if(!curSeg.recorderStartObservedAt) curSeg.recorderStartObservedAt=nowISO(); }
       catch(e){ markInterrupt('recorder_start_error','start_exception'); }
     }
@@ -344,8 +373,11 @@
         try{ recorder.stop(); }catch(e){}
       }
     }
-    function onSegmentStop(){
-      if(curSeg) curSeg.recorderStopObservedAt=nowISO(); // M15
+    function onSegmentStop(e){
+      // v0.7.2：停止済み旧recorderの遅延stopイベントは無視（中断→自動再開後に届くと二重startSegment＝recorder二重起動になるため）。
+      if(e && e.target && e.target!==recorder) return;
+      var seg=(e && e.target && e.target._segRec) || curSeg;
+      if(seg && !seg.recorderStopObservedAt) seg.recorderStopObservedAt=nowISO(); // M15
       if(userStopped){ finalize(); return; }
       if(!recording) return;
       if(document.visibilityState==='visible' && !interrupted){ startSegment(); }
@@ -358,10 +390,22 @@
     function stopWatchdog(){ if(watchdogTimer){ clearInterval(watchdogTimer); watchdogTimer=null; } captureStallStrikes=0; uploadStallStrikes=0; }
     function watchdogTick(){
       if(document.visibilityState!=='visible') return;
-      if(!recording || userStopped || interrupted){ captureStallStrikes=0; uploadStallStrikes=0; return; }
       var now=Date.now();
+      // v0.7.2：自動再開の getUserMedia が永久pending（resolve/rejectが来ない）場合の自己回復（旧attemptは世代で無効化）
+      if(interrupted && autoResumeInFlight && autoResumeStartedAt && (now-autoResumeStartedAt>AUTO_RESUME_STUCK_MS)){
+        resumeGen++; autoResumeInFlight=false; scheduleAutoResume();
+      }
+      // v0.7.2（Codexレビュー#1反映）：中断中なのに attempt もタイマーも無い＝座礁状態の安全網（イベント欠落・順序異常でもここで復帰）
+      if(recording && !userStopped && interrupted && !autoResumeInFlight && !autoResumeTimer){ scheduleAutoResume(); }
+      if(!recording || userStopped || interrupted){ captureStallStrikes=0; uploadStallStrikes=0; return; }
       if(now-lastDataAvailableAt > CAPTURE_STALL_MS){ captureStallStrikes++; } else { captureStallStrikes=0; }
-      if(captureStallStrikes>=2){ var secs=Math.round((now-lastDataAvailableAt)/1000); captureStallStrikes=0; markInterrupt('watchdog_capture_stall','no_dataavailable_'+secs+'s'); return; }
+      if(captureStallStrikes>=1){
+        var secs=Math.round((now-lastDataAvailableAt)/1000); captureStallStrikes=0;
+        // v0.7.2：死に区間の起点候補＝最後にdataが取れた時刻（markInterrupt側で現行セグメント開始まで更に遡る。
+        //   data無しのセグメントは録音区間として計上されないため、検知時刻からではなく実際に死んだ疑いの起点から
+        //   「既知の中断」として説明する＝silent_gap誤爆の構造対策。flushが実在すればfinalize時の整形で自動的に縮む）
+        markInterrupt('watchdog_capture_stall','no_dataavailable_'+secs+'s', new Date(lastDataAvailableAt).toISOString()); return;
+      }
       if(pending.size>0 && navigator.onLine && oldestPendingAt>0 && (now-oldestPendingAt > UPLOAD_STALL_MS)){ uploadStallStrikes++; } else { uploadStallStrikes=0; }
       if(uploadStallStrikes>=2){ uploadStallStrikes=0; showUploadStallWarning(); }
     }
@@ -370,41 +414,189 @@
     function showStorageWarning(){ $('stallnote').classList.remove('hidden'); $('stallnote').textContent='⚠️ 端末のストレージに保存できませんでした。録音後は必ず「保存しました」を確認してください（自動復旧できない場合があります）。'; }
 
     // ===== 中断・再開 =====
-    function markInterrupt(source, reason){
+    function markInterrupt(source, reason, deadFromISO){
       if(interrupted) return;
       interrupted=true;
-      if(curSeg && !curSeg.stopReason){ curSeg.stopReason='interrupt'; curSeg.stopRequestedAt=nowISO(); }
-      curInterruption={ detectedAt:nowISO(), detectedAtMonotonic:mono(), reason:reason||'unknown', detectionSource:source||'unknown', timingAccuracy:'approximate', resumedAt:null };
+      if(muteGraceTimer){ clearTimeout(muteGraceTimer); muteGraceTimer=null; }
+      // v0.7.2：suspectDeadFromAt＝「この時刻から捕捉が死んでいた疑い」の起点。現行セグメント開始まで遡る
+      //  （data無しに終わるセグメントは録音区間に計上されず、その間が unexplained になるため）。
+      //   遡り過ぎは finalize 時の computeAdjustedInterruptions が録音実績と突合してクリップする＝過大遡りは無害。
+      var det=nowISO();
+      var dead=deadFromISO||det;
+      var segS=curSeg && (curSeg.recorderStartObservedAt||curSeg.segmentStartRequestedAt);
+      if(segS && segS<dead) dead=segS;
+      if(curSeg && !curSeg.stopReason){ curSeg.stopReason='interrupt'; curSeg.stopRequestedAt=det; }
+      curInterruption={ detectedAt:det, detectedAtMonotonic:mono(), reason:reason||'unknown', detectionSource:source||'unknown',
+                        timingAccuracy:'approximate', resumedAt:null, suspectDeadFromAt:dead, resumeMode:null };
       interruptions.push(curInterruption);
+      // v0.7.2（Codexレビュー#2反映）：中断は種別を問わず「liveに見える」旧トラックを信用しない＝再開時は必ず取り直す。
+      //   iOSはバックグラウンドで捕捉が死んでも readyState/muted が健全のまま戻ることがあり、再利用すると40-50秒の追加損失、
+      //   最悪「無音チャンクが流れ続けて watchdog も沈黙」する。fresh getUserMedia のコスト（~数百ms・通常無プロンプト）の方が安い。
+      forceFreshStream=true;
       try{ if(recorder && recorder.state==='recording') recorder.stop(); }catch(e){}
       $('interrupt').classList.remove('hidden');
+      autoResumeDelay=AUTO_RESUME_BASE_MS;
+      scheduleAutoResume();   // v0.7.2：手動タップを待たず自動で再開を試みる（机置き運用＝画面を見ていない前提。ボタンは並存）
     }
-    function resumeRecording(){
-      var alive=stream && stream.getAudioTracks().some(function(t){ return t.readyState==='live'; });
-      var proceed=alive?Promise.resolve(stream):navigator.mediaDevices.getUserMedia({audio:true}).then(function(st){ stream=st; attachTrackWatch(st); return st; });
-      proceed.then(function(){
-        var gapSecs=null;
-        if(curInterruption && !curInterruption.resumedAt){ curInterruption.resumedAt=nowISO(); gapSecs=Math.round((new Date(curInterruption.resumedAt).getTime()-new Date(curInterruption.detectedAt).getTime())/1000); }
-        curInterruption=null; interrupted=false; recording=true;
-        lastDataAvailableAt=Date.now(); captureStallStrikes=0;
-        if(!cycleTimer) cycleTimer=setInterval(rotateSegment, SEG_MS);
-        startSegment();
-        $('interrupt').classList.add('hidden'); requestWake();
-        toast(gapSecs!=null ? ('録音を再開しました（約'+gapSecs+'秒間途切れ）') : '録音を再開しました');
-      }).catch(function(){ alert('録音の再開に失敗しました。マイク許可を確認して、もう一度お試しください。'); });
+    // ===== v0.7.2：自動再開エンジン（iOS foreground stall対策＝タップ不要の自己回復）=====
+    function scheduleAutoResume(){
+      if(!recording || userStopped || !interrupted) return;
+      if(autoResumeTimer || autoResumeInFlight) return;   // 単一飛行
+      autoResumeTimer=setTimeout(function(){ autoResumeTimer=null; tryAutoResume(); }, autoResumeDelay);
+    }
+    function rushAutoResume(){   // v0.7.2（Codexレビュー#3反映）：前面復帰・audioSession active 等の好機＝既存のバックオフ待ちを破棄して即試す
+      if(!recording || userStopped || !interrupted) return;
+      autoResumeDelay=AUTO_RESUME_BASE_MS;
+      if(autoResumeInFlight) return;                       // 進行中attemptがあればそれに任せる
+      if(autoResumeTimer){ clearTimeout(autoResumeTimer); autoResumeTimer=null; }
+      scheduleAutoResume();
+    }
+    function tryAutoResume(){
+      if(!recording || userStopped || !interrupted) return;
+      if(document.visibilityState!=='visible'){ scheduleAutoResume(); return; }   // 非表示中は試さず再arm（Codexレビュー#1：visibleイベント欠落でも座礁しない。bgではtimer凍結＝前面復帰時に発火）
+      var gen=++resumeGen;
+      autoResumeInFlight=true; autoResumeStartedAt=Date.now();
+      reacquireStream(gen).then(function(){
+        if(gen!==resumeGen) return;               // 追い越された孤児attempt＝共有フラグに一切触らない（後続attemptの所有物）
+        autoResumeInFlight=false;
+        if(!recording || userStopped || !interrupted) return;
+        autoResumeDelay=AUTO_RESUME_BASE_MS;
+        completeResume('auto');
+      }).catch(function(){
+        if(gen!==resumeGen) return;
+        autoResumeInFlight=false;
+        if(!recording || userStopped || !interrupted) return;
+        autoResumeDelay=Math.min(autoResumeDelay*2, AUTO_RESUME_MAX_MS);   // マイク占有中（通話等）はバックオフで粘る
+        scheduleAutoResume();
+      });
+    }
+    function reacquireStream(gen){
+      // 「readyState=live だが muted」の死にトラック再利用を禁止（iOS音声セッション中断後の典型）。
+      //   不健全なら必ず旧トラックを止めてから取り直す（iOSは同時1捕捉＝旧sessionを残すと新takeがmuteされ得る）。
+      var healthy = !forceFreshStream && stream && stream.getAudioTracks().some(function(t){ return t.readyState==='live' && !t.muted; });
+      if(healthy) return Promise.resolve(stream);
+      try{ if(stream) stream.getTracks().forEach(function(t){ t.stop(); }); }catch(e){}
+      return navigator.mediaDevices.getUserMedia({audio:true}).then(function(st){
+        if(gen!==resumeGen || userStopped || !recording || !interrupted){
+          try{ st.getTracks().forEach(function(t){ t.stop(); }); }catch(e){}   // 追い越された取得は即解放（マイク握りっぱなし防止）
+          var err=new Error('superseded_or_stopped'); err.superseded=true; throw err;
+        }
+        stream=st; attachTrackWatch(st); forceFreshStream=false; return st;
+      });
+    }
+    function completeResume(mode){
+      var gapSecs=null;
+      if(curInterruption && !curInterruption.resumedAt){
+        curInterruption.resumedAt=nowISO(); curInterruption.resumeMode=mode;
+        var from=curInterruption.suspectDeadFromAt||curInterruption.detectedAt;
+        gapSecs=Math.round((new Date(curInterruption.resumedAt).getTime()-new Date(from).getTime())/1000);
+      }
+      curInterruption=null; interrupted=false; recording=true;
+      lastDataAvailableAt=Date.now(); captureStallStrikes=0;
+      if(autoResumeTimer){ clearTimeout(autoResumeTimer); autoResumeTimer=null; }
+      if(!cycleTimer) cycleTimer=setInterval(rotateSegment, SEG_MS);
+      startSegment();
+      $('interrupt').classList.add('hidden'); requestWake();
+      toast(gapSecs!=null ? ('録音を再開しました（最大 約'+gapSecs+'秒間 途切れの可能性）') : '録音を再開しました');
+    }
+    function resumeRecording(){   // 手動ボタン＝自動と同じ経路（進行中の自動attempt/pending timerは世代とtimer回収で無効化）
+      if(autoResumeTimer){ clearTimeout(autoResumeTimer); autoResumeTimer=null; }
+      var gen=++resumeGen;
+      autoResumeInFlight=true; autoResumeStartedAt=Date.now();
+      reacquireStream(gen).then(function(){
+        if(gen!==resumeGen) return;
+        autoResumeInFlight=false;
+        if(!recording || userStopped || !interrupted) return;
+        completeResume('manual');
+      }).catch(function(e){
+        if(gen===resumeGen){ autoResumeInFlight=false; autoResumeDelay=Math.min(autoResumeDelay*2, AUTO_RESUME_MAX_MS); scheduleAutoResume(); }   // 失敗しても自動ループは生かし続ける
+        if(!(e && e.superseded)) alert('録音の再開に失敗しました。マイク許可を確認して、もう一度お試しください。');
+      });
     }
 
     // ===== 停止 → finalize =====
     function stopRecording(){
       if(!recording && !userStopped) return;
-      userStopped=true; recording=false; interrupted=false;
+      userStopped=true; recording=false;
+      resumeGen++;   // v0.7.2：飛行中の再開attemptを無効化（遅延して届いたgetUserMediaは reacquireStream 内で即解放される）
+      if(autoResumeTimer){ clearTimeout(autoResumeTimer); autoResumeTimer=null; }
+      if(muteGraceTimer){ clearTimeout(muteGraceTimer); muteGraceTimer=null; }
       stoppedAt=new Date();
+      // v0.7.2：開きっぱなしの中断は「停止まで捕捉が死んでいた」既知区間として閉じる
+      //  （resumedAt無しだと coverage で説明されず、中断放置の録音全体が silent_gap＝終端incomplete に誤爆するため）。
+      if(curInterruption && !curInterruption.resumedAt){ curInterruption.resumedAt=stoppedAt.toISOString(); curInterruption.resumeMode='stopped'; }
+      curInterruption=null; interrupted=false;
       if(curSeg && !curSeg.stopReason){ curSeg.stopReason='user_stop'; curSeg.stopRequestedAt=nowISO(); }
       clearInterval(cycleTimer); cycleTimer=null; clearInterval(timerId); releaseWake(); stopWatchdog();
       $('interrupt').classList.add('hidden');
       try{ if(recorder && recorder.state!=='inactive') recorder.stop(); else finalize(); }catch(e){ finalize(); }
     }
+    // __V072_PURE_BEGIN__（tests/client_interruptions_test.js がこのブロックを抽出して単体テストする＝DOM非依存・Dateのみ使用）
+    // v0.7.2：中断スパン整形＝coverage会計の正直化。
+    //   サーバ(Code.gs finalize)は unexplained = wallSpan − 録音区間∪ − Σ(中断 resumedAt−detectedAt) で silent_gap を判定する。
+    //   ここで emit する中断スパンを（1）検知遅延ぶんの死に区間まで遡らせ（suspectDeadFromAt）、
+    //   （2）録音区間・他の中断と重ならないよう差し引き/分割することで、
+    //   「説明できる死に区間は全部説明する」と「重複二重減算で unexplained が負になる（coverage_negative_gap＝終端incomplete）
+    //   事故の構造的防止」を同時に成立させる。detectedAt/resumedAt の原観測値は observedDetectedAt/observedResumedAt に保存。
+    function computeAdjustedInterruptions(capIntervals, inters, startedAtISO, stoppedAtISO){
+      function t(x){ var v=x?new Date(x).getTime():NaN; return isFinite(v)?v:NaN; }
+      function baseEntry(it){ return { detectedAt:it.detectedAt, detectedAtMonotonic:it.detectedAtMonotonic||null, resumedAt:it.resumedAt||null,
+        reason:it.reason, detectionSource:it.detectionSource, timingAccuracy:it.timingAccuracy||'approximate',
+        resumeMode:it.resumeMode||null, suspectDeadFromAt:it.suspectDeadFromAt||null,
+        observedDetectedAt:it.detectedAt, observedResumedAt:it.resumedAt||null }; }
+      var raw=(inters||[]).map(baseEntry);
+      var ws=t(startedAtISO), we=t(stoppedAtISO);
+      if(!isFinite(ws) || !isFinite(we) || we<=ws) return raw;   // 壁時計が揃わない＝調整せず従来どおり
+      // 録音区間の∪（サーバCode.gsと同じ規則をミラー：startedAtObserved／stopRequestedAt(truthy優先)||dataAvailableAt・wallへclamp）
+      var ivs=[];
+      (capIntervals||[]).forEach(function(ci){
+        var s=t(ci.startedAtObserved);
+        var e=ci.stopRequestedAt ? t(ci.stopRequestedAt) : t(ci.dataAvailableAt);
+        if(!isFinite(s)||!isFinite(e)||e<=s) return;   // サーバ側では invalid_interval anomaly＝terminal になる形＝どのみち調整は無意味
+        s=Math.max(s,ws); e=Math.min(e,we);
+        if(e>s) ivs.push([s,e]);
+      });
+      ivs.sort(function(a,b){ return a[0]-b[0]; });
+      var U=[]; ivs.forEach(function(iv){ var last=U[U.length-1]; if(last && iv[0]<=last[1]){ last[1]=Math.max(last[1],iv[1]); } else { U.push([iv[0],iv[1]]); } });
+      var DUST=250;   // 250ms未満の屑スパンは出さない（許容45,000msに対し無意味・エントリ肥大防止）
+      var out=[], prevEnd=-Infinity;
+      var sorted=raw.slice().sort(function(a,b){ return (t(a.suspectDeadFromAt||a.detectedAt)||0)-(t(b.suspectDeadFromAt||b.detectedAt)||0); });
+      sorted.forEach(function(it){
+        var dEnd=t(it.resumedAt);
+        if(!isFinite(dEnd)){ out.push(it); return; }             // 再開時刻なし＝サーバ加算0＝従来どおり素通し（forensicsのみ）
+        var dStart=t(it.suspectDeadFromAt); if(!isFinite(dStart)) dStart=t(it.detectedAt);
+        if(!isFinite(dStart)){ out.push(it); return; }
+        var s=Math.max(dStart, ws, prevEnd===-Infinity?-Infinity:prevEnd), e=Math.min(dEnd, we);
+        prevEnd=Math.max(prevEnd, e);
+        if(!(e>s)){ it.coverageAdjusted='zeroed'; it.resumedAt=it.detectedAt; out.push(it); return; }   // 実質0幅＝加算0で記録だけ残す
+        // [s,e] から録音∪ U を差し引く → 残った死にスパンを emit（複数に割れたら part 分割）
+        var holes=[], cur=s;
+        for(var i=0;i<U.length;i++){
+          var a=U[i][0], b=U[i][1];
+          if(b<=cur) continue;
+          if(a>=e) break;
+          if(a>cur) holes.push([cur, Math.min(a,e)]);
+          cur=Math.max(cur,b);
+          if(cur>=e) break;
+        }
+        if(cur<e) holes.push([cur,e]);
+        var kept=holes.filter(function(h){ return h[1]-h[0]>=DUST; });
+        if(!kept.length){ it.coverageAdjusted='zeroed'; it.resumedAt=it.detectedAt; out.push(it); return; }
+        kept.forEach(function(h,idx){
+          var en=baseEntry(it);
+          en.detectedAt=new Date(h[0]).toISOString(); en.resumedAt=new Date(h[1]).toISOString();
+          en.coverageAdjusted=true; en.part=(kept.length>1)?((idx+1)+'/'+kept.length):null;
+          out.push(en);
+        });
+      });
+      return out;
+    }
+    // __V072_PURE_END__
     function buildFinalizePayload(){
+      var caps=segments.map(function(s){ return { seq:s.seq, startedAtObserved:s.recorderStartObservedAt||s.segmentStartRequestedAt, stopRequestedAt:s.stopRequestedAt, recorderStopObservedAt:s.recorderStopObservedAt, dataAvailableAt:s.dataAvailableAt, stopReason:s.stopReason }; });
+      var adj;
+      try{ adj=computeAdjustedInterruptions(caps, interruptions, startedAt?startedAt.toISOString():null, stoppedAt?stoppedAt.toISOString():null); }
+      catch(e){ adj=interruptions.map(function(it){ return { detectedAt:it.detectedAt, detectedAtMonotonic:it.detectedAtMonotonic, resumedAt:it.resumedAt, reason:it.reason, detectionSource:it.detectionSource, timingAccuracy:it.timingAccuracy }; }); }   // 整形失敗でも finalize は従来形で必ず出す
       return {
         action:'finalize', payloadSchemaVersion:PAYLOAD_SCHEMA_VERSION,
         sessionId:sessionId, u:SALES_KEY, dealName:dealName,
@@ -413,8 +605,8 @@
         sessionStoppedAt: stoppedAt?stoppedAt.toISOString():null,
         endedAt:null,
         mimeType:mimeType, expectedChunks:seq, expectedCoverageMs: computeCoverageMs(),
-        captureIntervals: segments.map(function(s){ return { seq:s.seq, startedAtObserved:s.recorderStartObservedAt||s.segmentStartRequestedAt, stopRequestedAt:s.stopRequestedAt, recorderStopObservedAt:s.recorderStopObservedAt, dataAvailableAt:s.dataAvailableAt, stopReason:s.stopReason }; }),
-        interruptions: interruptions.map(function(it){ return { detectedAt:it.detectedAt, detectedAtMonotonic:it.detectedAtMonotonic, resumedAt:it.resumedAt, reason:it.reason, detectionSource:it.detectionSource, timingAccuracy:it.timingAccuracy }; }),
+        captureIntervals: caps,
+        interruptions: adj,
         finalizeIntentId: sessionId, clientFinalizedAt: nowISO()
       };
     }
@@ -540,10 +732,28 @@
         markInterrupt('visibilitychange_hidden','app_backgrounded_or_screen_off');
       } else if(document.visibilityState==='visible' && recording && !userStopped){
         requestWake();
-        if(interrupted){ $('interrupt').classList.remove('hidden'); }
+        if(interrupted){ $('interrupt').classList.remove('hidden'); rushAutoResume(); }   // v0.7.2：前面復帰＝既存バックオフを破棄して即時に自動再開を試す
         else if(recorder && recorder.state==='inactive'){ markInterrupt('visibilitychange_visible_inactive','recorder_inactive_on_resume'); }
       }
     });
+
+    // ===== v0.7.2：iOS Audio Session（対応環境のみ・watchdogより速い即時センサー）=====
+    //   iOSは通話/Siri/他アプリのマイク捕捉で音声セッションが 'interrupted' になり、マイクtrackが黙って死ぬことがある
+    //  （画面ON・前面でも起きる＝2026-07-22 阿部stallの型）。state変化を即時の中断検知／復帰トリガーに使う。
+    try{
+      if(navigator.audioSession && navigator.audioSession.addEventListener){
+        navigator.audioSession.addEventListener('statechange', function(){
+          try{
+            var s=navigator.audioSession.state;
+            if(s==='interrupted' && recording && !userStopped && !interrupted){
+              markInterrupt('audiosession_interrupted','audio_session_state_interrupted');
+            } else if(s==='active' && recording && !userStopped && interrupted){
+              rushAutoResume();   // 中断解除＝既存バックオフ待ちを破棄して即時に再開を試す
+            }
+          }catch(e){}
+        });
+      }
+    }catch(e){}
 
     // ===== ボタン =====
     $('startBtn').addEventListener('click', startRecording);
